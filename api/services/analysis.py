@@ -445,12 +445,14 @@ from statistics import mean
 import os
 from typing import List, Dict, Any
 from sqlalchemy.orm import Session
+from dotenv import load_dotenv
+load_dotenv()
 
 class ClimateService:
     def __init__(self):
         """Inicializa el servicio con las credenciales de PostgreSQL desde variables de entorno"""
         self.host = os.getenv("POSTGRES_HOST2")
-        self.port = os.getenv("POSTGRES_PORT2", 5435)
+        self.port = os.getenv("POSTGRES_PORT2", 5433)
         self.database = os.getenv("POSTGRES_DATABASE2")
         self.user = os.getenv("POSTGRES_USER2")
         self.password = os.getenv("POSTGRES_PASSWORD2")
@@ -929,6 +931,7 @@ class ClimateService:
         Obtiene datos climáticos agrupados por día para una ciudad específica
         """
         connection = self._get_connection()
+        print(f"Conectando a {self.host}:{self.port} db={self.database} user={self.user}")
         
         try:
             query = """
