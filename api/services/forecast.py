@@ -684,7 +684,19 @@ class DemandPredictor:
                 )[0][0]
                 
                 print(f"Predicción para ano {future_macro_vars.index[year_idx]}: {annual_pred_value:,.0f}")
-                
+                prev_value = float(np.expm1(last_log_totals[-1]))  # último total (histórico o predicho)
+                if prev_value > 0:
+                    implied_growth = (annual_pred_value - prev_value) / prev_value
+                    if implied_growth < -0.30:  # caída interanual > 30% = sospechosa
+                        hist_log_growth = hist_data['log_total'].diff().dropna()
+                        avg_log_growth = float(hist_log_growth.tail(5).mean()) if len(hist_log_growth) else 0.0
+                        avg_log_growth = max(0.0, avg_log_growth)  # no arrastrar tendencias negativas espurias
+                        sane_value = float(np.expm1(last_log_totals[-1] + avg_log_growth))
+                        print(f"⚠️ Predicción degenerada para {future_macro_vars.index[year_idx]}: "
+                              f"{annual_pred_value:,.0f} (growth {implied_growth:.1%}). "
+                              f"Corrigiendo a {sane_value:,.0f} (growth log medio {avg_log_growth:.4f}).")
+                        annual_pred_value = sane_value
+
                 # Guardar predicción
                 annual_predictions.append(annual_pred_value)
                 

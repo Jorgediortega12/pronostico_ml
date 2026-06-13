@@ -241,9 +241,9 @@ class MacroeconomicService:
         """
         # Obtener variables para el rango de anos
         variables = db.query(MacroeconomicsData).filter(
-            MacroeconomicsData.ano >= search.ano_inicio, 
+            MacroeconomicsData.ano >= search.ano_inicio,
             MacroeconomicsData.ano <= search.ano_fin
-        ).all()
+        ).order_by(MacroeconomicsData.eco_id, MacroeconomicsData.ano).all()
         
         # Verificar si hay variables disponibles
         if not variables:
