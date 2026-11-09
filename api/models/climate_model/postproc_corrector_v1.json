@@ -1,0 +1,71 @@
+{
+  "version": "v1",
+  "fecha_calibracion": "2026-08-03T14:33:05.103216+00:00",
+  "bias_corrector": {
+    "correccion_pct": -0.0013001035023186332,
+    "n_observaciones": 6,
+    "metodo": "promedio_error_reciente_prior_blend",
+    "peso_prior_usado": 0.7
+  },
+  "seasonal_corrector": {
+    "correcciones": {
+      "1": -0.003705534472589727,
+      "2": -0.003347370866737935,
+      "3": 0.0019227399344231993,
+      "4": -0.004340880826004264,
+      "5": 0.002144955063624749,
+      "6": -0.003535992082429061,
+      "7": 0.004946683759062759,
+      "8": 0.0021740746091706,
+      "9": -0.0022676330419263745,
+      "10": -0.0002999647536127873,
+      "11": -0.007700436539111247,
+      "12": 0.0032360395199476743
+    },
+    "n_observaciones_por_mes": {
+      "1": 14,
+      "2": 14,
+      "3": 14,
+      "4": 14,
+      "5": 14,
+      "6": 14,
+      "7": 14,
+      "8": 14,
+      "9": 14,
+      "10": 14,
+      "11": 14,
+      "12": 14
+    },
+    "metodo": "residual_promedio_por_mes_calendario",
+    "min_obs_por_mes": 3
+  },
+  "metodo": "bias_reciente + estacional_residual",
+  "train_meta": {
+    "n_meses_total": 168,
+    "n_observaciones_bias": 6,
+    "fuente_datos": "training\\forecast_climate\\artifacts\\dataset_mensual.csv",
+    "n_filas_dataset_mensual": 184,
+    "n_filas_usadas_calibracion": 168,
+    "anios_completos_usados": [
+      2011,
+      2012,
+      2013,
+      2014,
+      2015,
+      2016,
+      2017,
+      2018,
+      2019,
+      2020,
+      2021,
+      2022,
+      2023,
+      2024,
+      2025
+    ],
+    "mes_parcial_excluido": "2026-05",
+    "modelo_mensual": "xgboost (api/models/climate_model/monthly_model.pkl)",
+    "target": "demand_percentage (convertida a demand_value absoluto vía total anual real por año, antes de comparar contra demand_value real)",
+    "nota": "recalibrado tras excluir el mes parcial y los años incompletos, que contaminaban prediccion_cruda/yearly_total_real y sesgaban el corrector (ver reporte_decision.md, 'Correccion post-revision 3')."
+  }
+}
