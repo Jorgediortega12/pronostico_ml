@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional, Literal
+from pydantic import BaseModel, validator
+from typing import Optional, Literal, Dict
 from datetime import datetime
 from fastapi import HTTPException
 
@@ -156,6 +156,40 @@ class ForecastSchema(BaseModel):
     session_id: int
     start_date: str
     end_date: str
+    ipc_growth_by_year: Optional[Dict[int, float]] = None
+    enso_phase_by_month: Optional[Dict[str, str]] = None
+
+    @validator('ipc_growth_by_year')
+    def validate_ipc_growth_by_year(cls, v):
+        if v is None:
+            return v
+        for year, pct in v.items():
+            if not -15.0 <= pct <= 25.0:
+                raise ValueError(
+                    f"ipc_growth_by_year[{year}]={pct} fuera de rango permitido [-15.0, 25.0]"
+                )
+        return v
+
+    @validator('enso_phase_by_month')
+    def validate_enso_phase_by_month(cls, v):
+        if v is None:
+            return v
+        import re
+        _key_re = re.compile(r'^\d{4}-(0[1-9]|1[0-2])$')
+        _valid_phases = {'NORMAL', 'NIÑO', 'NIÑA'}
+        for key, phase in v.items():
+            key_str = str(key)
+            if not _key_re.match(key_str):
+                raise ValueError(
+                    f"enso_phase_by_month key '{key}' inválida; use formato YYYY-MM "
+                    f"(mes 01-12)"
+                )
+            if phase not in _valid_phases:
+                raise ValueError(
+                    f"enso_phase_by_month[{key_str}]='{phase}' inválido; "
+                    f"use exactamente una de: NORMAL, NIÑO, NIÑA"
+                )
+        return v
 
 class NewSessionSchema(BaseModel):
     user_id: int

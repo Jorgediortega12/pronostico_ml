@@ -15,6 +15,9 @@ RUN pip install --no-cache-dir -r /api/requirements.txt
 # Copiar el código fuente
 COPY ./api /api/api
 
+# Soporte del modelo climático + ONI (id=4): features, corrector y datasets históricos
+COPY ./training /api/training
+
 # Cargar las variables de entorno desde el archivo .env
 COPY .env /api/
 
