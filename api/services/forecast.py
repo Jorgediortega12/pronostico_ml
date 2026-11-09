@@ -556,9 +556,14 @@ class DemandPredictor:
         })
 
         # Lags
-        if current_year > hist_monthly['ano'].min():
+        # Los porcentajes mensuales solo sirven de un año COMPLETO: si el histórico llega a mitad de año
+        # (p. ej. se pronostica desde abril o noviembre), el porcentaje de cada mes de ese año parcial se
+        # calcula contra un total parcial y no representa la estacionalidad (además tiene menos de 12 meses,
+        # lo que antes fallaba con "Length of values (N) does not match length of index (12)").
+        hist_pct = hist_monthly[hist_monthly.groupby('ano')['mes'].transform('nunique') == 12]
+        if len(hist_pct) > 0 and current_year > hist_pct['ano'].min():
             # Datos del año anterior
-            prev_year_data = hist_monthly[hist_monthly['ano'] == current_year - 1]
+            prev_year_data = hist_pct[hist_pct['ano'] == current_year - 1]
 
             if len(prev_year_data) > 0:
                 # lag_12: usar año anterior completo
@@ -567,7 +572,7 @@ class DemandPredictor:
                 # Fallback: promedio histórico por mes
                 hist_avg_by_month = []
                 for m in months:
-                    hist_data = hist_monthly[hist_monthly['mes'] == m]['percentage']
+                    hist_data = hist_pct[hist_pct['mes'] == m]['percentage']
                     hist_avg_by_month.append(hist_data.mean() if len(hist_data) > 0 else 1/12)
                 X_pred['percentage_lag_12'] = hist_avg_by_month
 
@@ -583,9 +588,9 @@ class DemandPredictor:
             pct_mean_values = []
             for m in months:
                 # Obtener porcentajes históricos del mismo mes
-                same_month_data = hist_monthly[
-                    (hist_monthly['mes'] == m) &
-                    (hist_monthly['ano'] < current_year)
+                same_month_data = hist_pct[
+                    (hist_pct['mes'] == m) &
+                    (hist_pct['ano'] < current_year)
                 ].sort_values('ano')['percentage']
 
                 if len(same_month_data) > 0:
