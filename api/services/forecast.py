@@ -37,6 +37,7 @@ from sklearn.impute import SimpleImputer
 import joblib
 import warnings
 from ..other_models.demand import MonthlyDemand, Demand, YearlyDemand, TypeYear
+from api.services import sarimax_macro_constante
 from api.services.forecast_adjustments import apply_ipc_adjustment, apply_known_month_overrides, cap_xgb_sarimax_error
 warnings.filterwarnings('ignore')
 
@@ -1801,11 +1802,25 @@ class ForecastService:
             # Crear DataFrame para variables macroeconómicas futuras
             # (id=4 no las necesita: se deja None, no se usa en esa rama)
             future_macro_vars = None
+            _SARIMAX_MACRO_FALLBACK = False
             if search.id != 4:
                 future_macro_vars = pd.DataFrame(
                     updated_variables,
                     index=years_list
                 )
+                if search.id == 3:
+                    # Como el original (GMR Atenea): SARIMAX usa la macro del
+                    # último año conocido sostenida constante (api/data/
+                    # gmr_annual_es.csv) en vez de las proyecciones de la BD.
+                    # Si falla, se queda con las de la BD y se avisa en la respuesta.
+                    try:
+                        future_macro_vars = sarimax_macro_constante.build_future_macro_vars(
+                            n_years=len(years_list), start_year=start_year
+                        )
+                    except Exception as e:
+                        print(f"[SARIMAX] AVISO: no se pudo construir la macro constante, "
+                              f"usando proyecciones de BD: {str(e)}")
+                        _SARIMAX_MACRO_FALLBACK = True
 
             yearly_demands = db.query(YearlyDemand).all()
             years = {}
@@ -1913,6 +1928,13 @@ class ForecastService:
                 try:
                     model_path_name = 'api/models/climate_model/'
                     predictor = DemandPredictor(model_path=model_path_name)
+
+                    # Como el original (GMR Atenea): NO excluir años atípicos del
+                    # histórico climático. El modelo se entrenó incluyéndolos
+                    # (training/forecast_climate/serialize_final_model.py no los
+                    # excluye); excluirlos vía GMR_type_year (ATIPICO 2020/2021)
+                    # desfasaba el resultado.
+                    atypical_years = []
 
                     # Hindcast/forecast honesto: predecir los años del
                     # usuario usando solo histórico con year <= start_year-1.
@@ -2234,6 +2256,7 @@ class ForecastService:
                     "errores_porcentuales": [convert_to_native(val) for val in result_df['error_porcentual'].tolist()]
                 },
                 "growth": {str(k): float(v) for k, v in growth.items()},
+                "sarimax_macro_fallback": _SARIMAX_MACRO_FALLBACK,
                 "metricas_error": {
                     "mape_total_ventana": mape_total,
                     "error_minimo_%": error_minimo_porcentual,
