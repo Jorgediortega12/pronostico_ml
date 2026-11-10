@@ -38,6 +38,7 @@ import joblib
 import warnings
 from ..other_models.demand import MonthlyDemand, Demand, YearlyDemand, TypeYear
 from api.services import sarimax_macro_constante
+from api.services.demand_config_service import DemandConfigService, adjust_period_value
 from api.services.forecast_adjustments import apply_ipc_adjustment, apply_known_month_overrides, cap_xgb_sarimax_error
 warnings.filterwarnings('ignore')
 
@@ -3034,16 +3035,30 @@ class ForecastService:
 
     def predict_excel(self, search: ForecastSchema, db: Session):
         try:
+            config = DemandConfigService().get_config(db)
+
             # Obtener datos históricos
             mothly_demands = db.query(MonthlyDemand.year, MonthlyDemand.month, MonthlyDemand.value).all()
             mothly_demands = [{
                 'year': demand.year,
                 'month': demand.month,
-                'value': demand.value
+                'value': adjust_period_value(demand.value, demand.year, demand.month, config)
             } for demand in mothly_demands]
             
             # Obtener predicciones
             predictions = self.predict(search, db)
+
+            # Division de mercado: el historico se ajusta por periodo (arriba) y el pronostico del
+            # modelo se escala parejo, sin mirar la fecha, porque el modelo no conoce la fecha_limite
+            # y siempre extrapola en la escala completa. procesar_datos_y_crear_excel solo usa
+            # monthly_predictions.valores_pronostico (totales/crecimiento se recalculan con formulas).
+            factor = (config.porcentaje or 0) / 100.0
+            monthly_predictions = predictions.get('monthly_predictions') or {}
+            if monthly_predictions.get('valores_pronostico'):
+                monthly_predictions['valores_pronostico'] = [
+                    (v * factor) if v is not None else v
+                    for v in monthly_predictions['valores_pronostico']
+                ]
             
             # Crear el Excel
             excel_workbook = self.procesar_datos_y_crear_excel(mothly_demands, predictions)

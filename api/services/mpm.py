@@ -23,6 +23,7 @@ from openpyxl.utils import get_column_letter
 import io
 from typing import Optional
 from api.services.mpm_legacy import PredictMonthResult, predict_month
+from api.services.demand_config_service import DemandConfigService
 
 class MPMService:
     def _parse_file_date(self, year: str, filename: str) -> tuple[str, datetime]:
@@ -1246,6 +1247,51 @@ class MPMExcelGenerator:
                 4: "Promedios por tipo de día"
             }
             
+            # División de mercado: histórico real se ajusta por fecha exacta; predicciones y total
+            # se ajustan parejo porque el modelo no conoce la fecha límite. Se extraen valores
+            # planos (no el objeto) porque el bucle de abajo llama a mpm_service.predict() para 4
+            # métodos sobre la misma sesión.
+            _demand_config_row = DemandConfigService().get_config(db)
+            demand_config_factor = (_demand_config_row.porcentaje or 0) / 100.0
+            demand_config_cutoff = datetime.combine(_demand_config_row.fecha_limite, datetime.min.time().replace(hour=23, minute=59, second=59))
+
+            def _to_datetime(value):
+                # Import local (no el `date` del módulo): más abajo, en esta misma función, hay un
+                # `for i, date in enumerate(all_dates)` que convierte `date` en variable local;
+                # referenciar el `date` global desde este closure falla en ejecución.
+                from datetime import date as _date_cls
+                if isinstance(value, datetime):
+                    return value
+                if isinstance(value, _date_cls):
+                    return datetime.combine(value, datetime.min.time())
+                if isinstance(value, str):
+                    try:
+                        return datetime.strptime(value[:10], "%Y-%m-%d")
+                    except ValueError:
+                        return None
+                return None
+
+            def _apply_demand_split(result):
+                if not result:
+                    return result
+                dates = result.get("dates") or []
+                if "historic_demands" in result and result["historic_demands"]:
+                    scaled = []
+                    for i, v in enumerate(result["historic_demands"]):
+                        fecha = _to_datetime(dates[i]) if i < len(dates) else None
+                        if v is not None and fecha is not None and fecha <= demand_config_cutoff:
+                            scaled.append(v * demand_config_factor)
+                        else:
+                            scaled.append(v)
+                    result["historic_demands"] = scaled
+                if "prediction" in result and result["prediction"]:
+                    result["prediction"] = [
+                        (v * demand_config_factor) if v is not None else v for v in result["prediction"]
+                    ]
+                if result.get("total_predictions") is not None:
+                    result["total_predictions"] = result["total_predictions"] * demand_config_factor
+                return result
+
             # Para cada método, obtener las predicciones
             for method_id in [1, 2, 3, 4]:
                 search = MPMPredictSchema(
@@ -1258,6 +1304,7 @@ class MPMExcelGenerator:
                 try:
                     # CORRECCIÓN: Cambiar mmp_service por mpm_service
                     result = mpm_service.predict(search, db)
+                    result = _apply_demand_split(result)
                     predictions_data[method_id] = result
                     print(f"Método {method_id} - Datos obtenidos correctamente")
                     if result:
