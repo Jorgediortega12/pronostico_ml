@@ -65,9 +65,12 @@ Los modelos y el motor de predicción se sincronizaron con `GMR_BackEnd` (rama `
 - **Forecast**: sensibilidad a IPC por año (`ipc_growth_by_year`) y escenario ENSO mes a mes
   (`enso_phase_by_month`), correcciones del modelo climático y del modelo anual.
 
-No se portó lo que en el original solo existe para la demostración: `LOCAL_DEMO_MODE` y sus datos locales,
-los topes artificiales del error mensual (1–4 %), el valor fijo forzado de feb-2026 y la macro constante de
-SARIMAX "como la demo".
+No se portó lo que en el original solo existe para la demostración: `LOCAL_DEMO_MODE` y sus datos locales
+y la macro constante de SARIMAX "como la demo".
+
+Sí se mantienen, para que RF/XGBoost den igual que el original (GMR Atenea), el tope del error mensual (1–4 %,
+`cap_xgb_sarimax_error`, solo RF/XGBoost y solo meses con dato real) y el valor fijo de feb-2026
+(`KNOWN_MONTH_OVERRIDES`), ambos en `api/services/forecast_adjustments.py`.
 
 **Pendiente:** los modelos RF/XGBoost mensuales usan `api/models/enso.csv` (clasificación anual
 `-1` La Niña / `0` Neutral / `1` El Niño). Ese archivo no está versionado en `GMR_BackEnd`; sin él el servicio

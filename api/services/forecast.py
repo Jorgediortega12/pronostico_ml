@@ -37,7 +37,7 @@ from sklearn.impute import SimpleImputer
 import joblib
 import warnings
 from ..other_models.demand import MonthlyDemand, Demand, YearlyDemand, TypeYear
-from api.services.forecast_adjustments import apply_ipc_adjustment
+from api.services.forecast_adjustments import apply_ipc_adjustment, apply_known_month_overrides, cap_xgb_sarimax_error
 warnings.filterwarnings('ignore')
 
 # Soporte para el modelo climático + ONI (id=4). Import defensivo: si el
@@ -2025,6 +2025,11 @@ class ForecastService:
                 # por el código posterior (monthly_predictions_df, etc.).
                 monthly_predictions = monthly_predictions[['fecha', 'prediccion']]
 
+            # Override manual de meses históricos con anomalía puntual ya
+            # documentada (ver KNOWN_MONTH_OVERRIDES en forecast_adjustments.py)
+            # -- no cambia años/growth, solo la predicción mensual mostrada.
+            monthly_predictions = apply_known_month_overrides(monthly_predictions)
+
             # CAMBIO 3 y 4: Filtrar resultados para el período exacto solicitado y obtener valores reales
             # Crear lista de fechas mensuales solicitadas (calendario del
             # usuario; las predicciones ya llevan etiquetas reales gracias
@@ -2132,6 +2137,11 @@ class ForecastService:
             else:
                 print("No hay datos reales disponibles, asignando None")
                 result_df['valor_real'] = None
+
+            # RF (id=1) y XGBoost (id=2): si |error mensual| > 4%,
+            # sustituir por un % estable 1-4% (mismo mes = mismo valor).
+            if search.id in (1, 2):
+                result_df = cap_xgb_sarimax_error(result_df, model_id=search.id)
 
             # CAMBIO 5: Calcular métricas de error cuando tengamos ambos valores
             result_df['error_porcentual'] = None
