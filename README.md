@@ -51,3 +51,29 @@ con `ML_SERVICE_USER` / `ML_SERVICE_PASSWORD` de este `.env`.
   no depende de esa tabla.
 - `requirements.txt` conserva libs que ya no se usan tras el recorte (`oracledb`,
   `ldap3`, etc.); se pueden depurar más adelante sin prisa.
+
+## Actualización de modelos desde GMR_BackEnd
+
+Los modelos y el motor de predicción se sincronizaron con `GMR_BackEnd` (rama `main`):
+
+- **Modelos reentrenados**: `rf_model`, `xgb_model` (mensual, ahora con las variables `dias_totales` y `enso`),
+  `xgboost_only`, `xgboost_multimodelo` y `xgboost_varias_multimodelo`.
+- **Modelo climático + ONI (id=4)**: `api/models/climate_model/` y el soporte en `training/forecast_climate/`
+  (`features.py`, `postprocess_calibration.py` y los datasets históricos de `artifacts/`).
+- **MPM**: el motor de paridad con el sistema anterior (`api/services/mpm_legacy/`) reemplaza al XGBoost
+  en `mpm.py`.
+- **Forecast**: sensibilidad a IPC por año (`ipc_growth_by_year`) y escenario ENSO mes a mes
+  (`enso_phase_by_month`), correcciones del modelo climático y del modelo anual.
+
+No se portó lo que en el original solo existe para la demostración: `LOCAL_DEMO_MODE` y sus datos locales
+y la macro constante de SARIMAX "como la demo".
+
+Sí se mantienen, para que RF/XGBoost den igual que el original (GMR Atenea), el tope del error mensual (1–4 %,
+`cap_xgb_sarimax_error`, solo RF/XGBoost y solo meses con dato real) y el valor fijo de feb-2026
+(`KNOWN_MONTH_OVERRIDES`), ambos en `api/services/forecast_adjustments.py`.
+
+**Pendiente:** los modelos RF/XGBoost mensuales usan `api/models/enso.csv` (clasificación anual
+`-1` La Niña / `0` Neutral / `1` El Niño). Ese archivo no está versionado en `GMR_BackEnd`; sin él el servicio
+usa `0` (Neutral) para todos los años y lo avisa en el log. Copiarlo desde el servidor del original.
+
+Pruebas: `pytest tests` (modelo climático, post-procesamiento y motor MPM legacy).

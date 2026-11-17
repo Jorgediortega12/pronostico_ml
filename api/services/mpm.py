@@ -4,7 +4,7 @@ import os
 from ..other_models.demand import LastDemandDocument, Demand
 from ..other_models.climate import Climate
 from sqlalchemy import func, case
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from .functions.xgb_only import DemandOnlyPredictor
 from .functions.xgb_temp import DemandPredictor
 from .functions.xgb_varias import DemandVariasPredictor
@@ -21,8 +21,9 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import io
-from datetime import datetime
 from typing import Optional
+from api.services.mpm_legacy import PredictMonthResult, predict_month
+from api.services.demand_config_service import DemandConfigService
 
 class MPMService:
     def _parse_file_date(self, year: str, filename: str) -> tuple[str, datetime]:
@@ -198,7 +199,7 @@ class MPMService:
         """
         try:
             latest_files = {}
-            
+
             for file_type in ['txf', 'txr', 'tx2']:
                 last_doc = db.query(LastDemandDocument).filter_by(
                     document_type=file_type.lower()
@@ -435,8 +436,8 @@ class MPMService:
             dates = []
 
             # Validar que previous_days esté en el rango correcto
-            if previous_days < 0 or previous_days > 15:
-                raise Exception("previous_days debe estar entre 0 y 15")
+            if previous_days < 0 or previous_days > 60:
+                raise Exception("previous_days debe estar entre 0 y 60")
 
             # Calcular fechas de inicio y fin del mes actual
             current_month_start = datetime(year, month, 1)
@@ -506,7 +507,7 @@ class MPMService:
                 for ciudad in ciudades_principales:
                     try:
                         city_data = climate.get_climate_daily_all_types_per_city(db=db, search=search_temp, city=ciudad)
-                        
+
                         # Encontrar el índice de inicio en los datos de la ciudad
                         city_start_index = 0
                         if dates and city_data["fechas"]:
@@ -587,7 +588,301 @@ class MPMService:
         except Exception as e:
             raise Exception(f"Exception on get_demand: {str(e)}")
 
+    @staticmethod
+    def _normalize_climate_date(value) -> str:
+        if isinstance(value, datetime):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        return str(value)[:10]
+
+    def _build_clima_dict(self, db: Session, dates_str: list[str]) -> dict:
+        """Obtiene clima por ciudad y lo alinea por fecha al mes solicitado."""
+        if not dates_str:
+            return {}
+
+        climate = ClimateService()
+        search = SearchAllClimateTypeSchema(
+            fecha_inicio=dates_str[0],
+            fecha_fin=dates_str[-1],
+            id=0,
+        )
+        date_indexes = {value: index for index, value in enumerate(dates_str)}
+        fields = {
+            "temp_max": ("temperaturas", "maximas"),
+            "temp_min": ("temperaturas", "minimas"),
+            "temp_avg": ("temperaturas", "promedios"),
+            "hum_max": ("humedades", "maximas"),
+            "hum_min": ("humedades", "minimas"),
+            "hum_avg": ("humedades", "promedios"),
+            "vel_max": ("velocidades", "maximas"),
+            "vel_min": ("velocidades", "minimas"),
+            "vel_avg": ("velocidades", "promedios"),
+        }
+        cities = {
+            "Bolivar": "bolivar",
+            "Cesar": "cesar",
+            "CordobaSucre": "cordoba_sucre",
+        }
+        clima = {}
+
+        for city, key in cities.items():
+            aligned = {field: [None] * len(dates_str) for field in fields}
+            try:
+                city_data = climate.get_climate_daily_all_types_per_city(
+                    db=db, search=search, city=city
+                )
+                city_dates = [
+                    self._normalize_climate_date(value)
+                    for value in city_data.get("fechas", [])
+                ]
+                for field, (category, aggregation) in fields.items():
+                    values = city_data.get(category, {}).get(aggregation, [])
+                    for climate_date, value in zip(city_dates, values):
+                        index = date_indexes.get(climate_date)
+                        if index is not None:
+                            aligned[field][index] = (
+                                float(value) if value is not None else None
+                            )
+            except Exception as exc:
+                print(f"Error obteniendo datos de {city} en predict: {str(exc)}")
+            clima[key] = aligned
+
+        return clima
+
+    @staticmethod
+    def _holiday_dates(year: int) -> set[date]:
+        result = set()
+        for holiday in get_colombia_holidays_by_year(year):
+            value = holiday.date
+            if isinstance(value, datetime):
+                value = value.date()
+            result.add(value)
+        return result
+
+    def _predict_with_legacy_engine(
+        self, search: MPMPredictSchema, db: Session
+    ) -> dict:
+        requested_date = datetime.strptime(search.last_date, "%Y-%m-%d").date()
+        year = requested_date.year
+        month = requested_date.month
+        last_day = calendar.monthrange(year, month)[1]
+        dates = [date(year, month, day) for day in range(1, last_day + 1)]
+        dates_str = [value.isoformat() for value in dates]
+
+        # El motor necesita al menos el mes anterior completo como pool de
+        # referencia para sábado/domingo-festivo (similar_days.py): con una
+        # ventana angosta (p. ej. previous_days=5 sin ningún sábado en esos
+        # 5 días) el pool queda vacío y esos días se pronostican en 0. 31
+        # fuerza a get_demand a devolver el mes anterior completo (su propio
+        # clipping interno nunca excede ese mes), sin alterar lo que el
+        # usuario ve/exporta como "previous_days" en el resto de la request.
+        effective_previous_days = max(search.previous_days, 31)
+        demand_data = self.get_demand(year, month, effective_previous_days, db)
+        demand_by_date = {}
+        previous_days_without_temp = []
+        previous_month = month - 1 or 12
+        previous_year = year if month > 1 else year - 1
+
+        for raw_date, raw_demand in zip(
+            demand_data["dates"], demand_data["daily_demands"]
+        ):
+            demand_date = datetime.strptime(raw_date, "%Y-%m-%d").date()
+            demand = float(raw_demand)
+            if demand_date.year == year and demand_date.month == month:
+                # last_date marca el corte del histórico: los días del mes
+                # posteriores a esa fecha no se toman como observados aunque
+                # existan en BD, para que el motor los pronostique.
+                if demand_date <= requested_date:
+                    demand_by_date[demand_date] = demand
+            elif (
+                demand_date.year == previous_year
+                and demand_date.month == previous_month
+            ):
+                previous_days_without_temp.append((demand_date, demand))
+
+        if not demand_by_date:
+            raise Exception("No hay datos históricos para realizar la predicción")
+
+        # Se consultan ambos años para cubrir correctamente diciembre -> enero.
+        holidays = self._holiday_dates(year) | self._holiday_dates(year - 1)
+        clima = self._build_clima_dict(db, dates_str)
+        previous_dates_str = [
+            demand_date.isoformat()
+            for demand_date, _ in previous_days_without_temp
+        ]
+        previous_clima = self._build_clima_dict(db, previous_dates_str)
+        previous_baq_temps = previous_clima.get("bolivar", {}).get(
+            "temp_avg", []
+        )
+        previous_days_demand = [
+            (
+                demand_date,
+                demand,
+                (
+                    float(previous_baq_temps[index])
+                    if index < len(previous_baq_temps)
+                    and previous_baq_temps[index] is not None
+                    else float("nan")
+                ),
+            )
+            for index, (demand_date, demand) in enumerate(
+                previous_days_without_temp
+            )
+        ]
+        temps = {
+            city: clima[city]["temp_avg"]
+            for city in ("bolivar", "cordoba_sucre", "cesar")
+        }
+
+        result: PredictMonthResult = predict_month(
+            dates=dates,
+            demand_by_date=demand_by_date,
+            previous_days_demand=previous_days_demand,
+            holidays=holidays,
+            temps=temps,
+            scenario=search.type,
+            method_id=search.id,
+        )
+        bolivar = clima["bolivar"]
+
+        return {
+            "historic_demands": [float(value) for value in result.historic_demands],
+            "prediction": [float(value) for value in result.daily_predictions],
+            "dates": result.all_dates,
+            "day_types": self.get_type_day(result.all_dates, year),
+            "temp": bolivar["temp_avg"],
+            "max_temp": bolivar["temp_max"],
+            "min_temp": bolivar["temp_min"],
+            # El frontend divide entre 1e6; se conserva ese contrato para mostrar GW.
+            "total_predictions": float(result.total_gw * 1_000_000),
+            "clima": clima,
+        }
+
     def predict(self, search: MPMPredictSchema, db: Session):
+        try:
+            return self._predict_with_legacy_engine(search, db)
+        except Exception as e:
+            raise Exception(f"Exception on predict: {str(e)}")
+
+    def _predict_daily_with_xgb(
+        self,
+        search: MPMPredictSchema,
+        db: Session,
+        all_dates: list[str],
+        historic_demands: list[float],
+        prediction_dates: list[str],
+        temp_data: dict,
+    ) -> list[float]:
+        """Conserva disponible el cálculo diario anterior basado en XGBoost."""
+        frame = pd.DataFrame({
+            "Fecha": pd.to_datetime(all_dates, format="%Y-%m-%d"),
+            "P": historic_demands,
+        })
+        predictions = []
+
+        if search.id == 1:
+            predictor = self.load_model_only()
+            for _ in prediction_dates:
+                prediction, _ = predictor.predict(frame)
+                prediction = float(prediction)
+                predictions.append(prediction)
+                frame = pd.concat([
+                    frame,
+                    pd.DataFrame({
+                        "Fecha": [frame["Fecha"].iloc[-1] + pd.Timedelta(days=1)],
+                        "P": [prediction],
+                    }),
+                ], ignore_index=True)
+            return predictions
+
+        if search.id == 4:
+            day_types = self.get_type_day(all_dates, int(search.last_date[:4]))
+            groups = {"ordinary": [], "saturday": [], "holiday": []}
+            for value, day_type in zip(historic_demands, day_types):
+                if "Sábado" in day_type:
+                    groups["saturday"].append(value)
+                elif "Domingo" in day_type or "festivo" in day_type:
+                    groups["holiday"].append(value)
+                else:
+                    groups["ordinary"].append(value)
+            averages = {
+                key: float(np.mean(values)) if values else 0.0
+                for key, values in groups.items()
+            }
+            for day_type in self.get_type_day(
+                prediction_dates, int(search.last_date[:4])
+            ):
+                key = (
+                    "saturday" if "Sábado" in day_type
+                    else "holiday"
+                    if "Domingo" in day_type or "festivo" in day_type
+                    else "ordinary"
+                )
+                predictions.append(averages[key])
+            return predictions
+
+        scenario = {0: "caluroso", 1: "templado", 2: "fresco"}.get(
+            search.type, "templado"
+        )
+        climate_dates = [
+            self._normalize_climate_date(value)
+            for value in temp_data.get("lista_fechas", [])
+        ]
+        avg_by_date = dict(zip(climate_dates, temp_data.get("lista_avg", [])))
+
+        if search.id == 2:
+            predictor = self.load_model_multimodelo()
+            frame["t"] = [avg_by_date.get(value) for value in all_dates]
+            for prediction_date in prediction_dates:
+                prediction, _ = predictor.predict(frame, scenario)
+                prediction = float(prediction)
+                predictions.append(prediction)
+                frame = pd.concat([
+                    frame,
+                    pd.DataFrame({
+                        "Fecha": [pd.Timestamp(prediction_date)],
+                        "P": [prediction],
+                        "t": [avg_by_date.get(prediction_date)],
+                    }),
+                ], ignore_index=True)
+            return predictions
+
+        if search.id == 3:
+            predictor = self.load_model_varias_multimodelo()
+            dates_range = all_dates + prediction_dates
+            clima = self._build_clima_dict(db, dates_range)
+            date_indexes = {value: index for index, value in enumerate(dates_range)}
+            city_columns = {
+                "t_CTG": clima["bolivar"]["temp_avg"],
+                "t_MON": clima["cordoba_sucre"]["temp_avg"],
+                "t_VDP": clima["cesar"]["temp_avg"],
+            }
+            for column, values in city_columns.items():
+                frame[column] = [
+                    values[date_indexes[value]] for value in all_dates
+                ]
+            for prediction_date in prediction_dates:
+                prediction, _ = predictor.predict(frame, scenario)
+                prediction = float(prediction)
+                predictions.append(prediction)
+                index = date_indexes[prediction_date]
+                frame = pd.concat([
+                    frame,
+                    pd.DataFrame({
+                        "Fecha": [pd.Timestamp(prediction_date)],
+                        "P": [prediction],
+                        **{
+                            column: [values[index]]
+                            for column, values in city_columns.items()
+                        },
+                    }),
+                ], ignore_index=True)
+            return predictions
+
+        raise ValueError("id debe ser 1, 2, 3 o 4")
+
+    def _predict_with_xgb(self, search: MPMPredictSchema, db: Session):
         try:
             date = search.last_date
             year = int(date[:4])
@@ -600,8 +895,12 @@ class MPMService:
             month_days = calendar.monthrange(year, month)[1]
             last_month_date = f"{year}-{month:02d}-{last_day:02d}"
             
+            # Para xgb_only (id=1) y multimodelo (id=2) las ventanas rolling son de hasta 30 días;
+            # se necesitan al menos 30 días previos para que arranquen llenas de datos reales.
+            effective_previous_days = max(search.previous_days, 30) if search.id in (1, 2, 3) else search.previous_days
+
             # Obtener datos históricos desde la BD (incluye días previos para cálculos)
-            historic_data = self.get_demand(year, month, search.previous_days, db)
+            historic_data = self.get_demand(year, month, effective_previous_days, db)
             historic_demands = historic_data["daily_demands"]
             all_dates = historic_data["dates"]
             
@@ -753,228 +1052,14 @@ class MPMService:
             days_to_predict = len(prediction_dates_array)
             print("days_to_predict", days_to_predict)
             
-            # Demand only prediction
-            if search.id == 1:
-                predictions = []
-                predictor = self.load_model_only()
-                
-                # Usar TODOS los datos históricos (incluyendo días previos) para el modelo
-                df = pd.DataFrame({
-                    "Fecha": pd.to_datetime(all_dates, format='%Y-%m-%d'),
-                    "P": historic_demands
-                })
-                
-                df.to_csv("mpm_prueba.csv")
-
-                for i in range(1, days_to_predict + 1):
-                    prediction, _ = predictor.predict(df)
-                    
-                    last_date = df["Fecha"].iloc[-1]
-                    correct_prediction_date = last_date + pd.Timedelta(days=1)
-                    
-                    # Convertir predicción a float de Python
-                    predictions.append(float(prediction))
-                    new_row = pd.DataFrame({"Fecha": [correct_prediction_date], "P": [float(prediction)]})
-                    df = pd.concat([df, new_row], ignore_index=True)
-
-            # Temperature and demand prediction
-            elif search.id == 2:
-                # Determinar tipo de día basado en search.type
-                if search.type == 0:
-                    day_type = "caluroso"
-                elif search.type == 1:
-                    day_type = "templado"
-                elif search.type == 2:
-                    day_type = "fresco"
-                else:
-                    day_type = "templado"  # valor por defecto
-                    
-                predictions = []
-                predictor = self.load_model_multimodelo()
-
-                # Find temperature index offset (diferencia entre fechas de temperatura y fechas de demanda)
-                temp_dates = temp_data["lista_fechas"]
-                temp_start_index = 0
-                
-                for i, temp_date in enumerate(temp_dates):
-                    if temp_date == all_dates[0]:
-                        temp_start_index = i
-                        break
-                
-                # Usar TODOS los datos históricos (incluyendo días previos) para el modelo
-                df = pd.DataFrame({
-                    "Fecha": pd.to_datetime(all_dates, format='%Y-%m-%d'),
-                    "P": historic_demands
-                })
-                
-                # Agregar temperatura correspondiente
-                for i in range(len(historic_demands)):
-                    temp_index = temp_start_index + i
-                    if temp_index < len(temp_list):
-                        # Usar siempre temperatura promedio para el método 2 (una temperatura)
-                        df.loc[i, "t"] = temp_list[temp_index]
-                
-                # Para las predicciones futuras, usar temperatura promedio
-                temp_list_to_predict = temp_list[len(historic_demands):]
-
-                for i in range(1, days_to_predict + 1):
-                    # Pasar day_type como argumento requerido
-                    prediction, _ = predictor.predict(df, day_type)
-                    
-                    last_date = df["Fecha"].iloc[-1]
-                    correct_prediction_date = last_date + pd.Timedelta(days=1)
-                    
-                    # Convertir predicción a float de Python
-                    predictions.append(float(prediction))
-                    
-                    new_row = pd.DataFrame({
-                        "Fecha": [correct_prediction_date], 
-                        "P": [float(prediction)], 
-                        "t": [temp_list_to_predict[i-1]]
-                    })
-                    df = pd.concat([df, new_row], ignore_index=True)
-
-            # Three temperatures prediction
-
-            elif search.id == 3:
-                # Determinar tipo de día basado en search.type
-                if search.type == 0:
-                    day_type = "caluroso"
-                elif search.type == 1:
-                    day_type = "templado"
-                elif search.type == 2:
-                    day_type = "fresco"
-                else:
-                    day_type = "templado"  # valor por defecto
-                    
-                predictions = []
-                # CORRECCIÓN: Usar load_model_varias_multimodelo para variación climática
-                predictor = self.load_model_varias_multimodelo()
-
-                # ===== NUEVA SECCIÓN: Obtener datos por ciudad =====
-                climate = ClimateService()
-                
-                # Obtener temperaturas específicas de las 3 ciudades
-                search_temp_cities = SearchAllClimateTypeSchema(
-                    fecha_inicio=all_dates[0],
-                    fecha_fin=last_month_date,
-                    id=0  # id=0 para temperaturas
-                )
-                
-                # Bolívar para t_CTG
-                bolivar_data = climate.get_climate_daily_all_types_per_city(db=db, search=search_temp_cities, city="Bolivar")
-                temp_bolivar = bolivar_data["temperaturas"]["promedios"]
-                
-                # Barranquilla para t_MON
-                barranquilla_data = climate.get_climate_daily_all_types_per_city(db=db, search=search_temp_cities, city="CordobaSucre")
-                temp_barranquilla = barranquilla_data["temperaturas"]["promedios"]
-                
-                # Cesar para t_VDP
-                cesar_data = climate.get_climate_daily_all_types_per_city(db=db, search=search_temp_cities, city="Cesar")
-                temp_cesar = cesar_data["temperaturas"]["promedios"]
-                
-                # Encontrar índice de inicio para las temperaturas de las ciudades
-                temp_start_index = 0
-                for i, temp_date in enumerate(bolivar_data["fechas"]):
-                    if temp_date == all_dates[0]:
-                        temp_start_index = i
-                        break
-                
-                # Usar TODOS los datos históricos (incluyendo días previos) para el modelo
-                df = pd.DataFrame({
-                    "Fecha": pd.to_datetime(all_dates, format='%Y-%m-%d'),
-                    "P": historic_demands
-                })
-                
-                # Agregar las tres temperaturas usando datos específicos de cada ciudad
-                for i in range(len(historic_demands)):
-                    temp_index = temp_start_index + i
-                    if temp_index < len(temp_bolivar):
-                        df.loc[i, "t_CTG"] = temp_bolivar[temp_index]    # Bolívar
-                        df.loc[i, "t_MON"] = temp_barranquilla[temp_index]  # Barranquilla
-                        df.loc[i, "t_VDP"] = temp_cesar[temp_index]      # Cesar
-                
-                # Preparar temperaturas para predicciones futuras
-                temp_list_to_predict_ctg = temp_bolivar[len(historic_demands):]      # Bolívar
-                temp_list_to_predict_mon = temp_barranquilla[len(historic_demands):] # Barranquilla
-                temp_list_to_predict_vdp = temp_cesar[len(historic_demands):]        # Cesar
-
-                for i in range(1, days_to_predict + 1):
-                    # Pasar day_type como argumento requerido
-                    prediction, _ = predictor.predict(df, day_type)
-                    
-                    last_date = df["Fecha"].iloc[-1]
-                    correct_prediction_date = last_date + pd.Timedelta(days=1)
-                    
-                    # Convertir predicción a float de Python
-                    predictions.append(float(prediction))
-                    new_row = pd.DataFrame({
-                        "Fecha": [correct_prediction_date], 
-                        "P": [float(prediction)], 
-                        "t_CTG": [temp_list_to_predict_ctg[i-1]],  # Bolívar
-                        "t_MON": [temp_list_to_predict_mon[i-1]],  # Barranquilla
-                        "t_VDP": [temp_list_to_predict_vdp[i-1]]   # Cesar
-                    })
-                    df = pd.concat([df, new_row], ignore_index=True)
-
-            # Average demand prediction
-            elif search.id == 4:
-                predictions = []
-                ordinary_days_demands = []
-                saturdays_demands = []
-                sundays_and_holidays_demands = []
-                
-                # Obtener los tipos de día para las fechas históricas (TODOS los datos)
-                historic_day_types = self.get_type_day(all_dates, year)
-                
-                # Clasificar los datos históricos (usar TODOS para calcular promedios)
-                for i in range(len(historic_demands)):
-                    if historic_day_types[i] == "Sábado":
-                        saturdays_demands.append(historic_demands[i])
-                    elif historic_day_types[i] == "Domingo" or "festivo" in historic_day_types[i]:
-                        sundays_and_holidays_demands.append(historic_demands[i])
-                    else:
-                        ordinary_days_demands.append(historic_demands[i])
-                
-                # Calcular promedios y convertir a float de Python
-                ordinary_demand = float(np.mean(ordinary_days_demands)) if ordinary_days_demands else 0.0
-                saturday_demand = float(np.mean(saturdays_demands)) if saturdays_demands else 0.0
-                sunday_demand = float(np.mean(sundays_and_holidays_demands)) if sundays_and_holidays_demands else 0.0
-                
-                print("ordinary_demand", ordinary_demand)
-                print("saturday_demand", saturday_demand)
-                print("sunday_demand", sunday_demand)
-                
-
-                df = pd.DataFrame({
-                    "Fecha": pd.to_datetime(all_dates, format='%Y-%m-%d'),
-                    "P": historic_demands
-                })
-
-                # Obtener los tipos de día para las fechas de predicción
-                future_day_types = self.get_type_day(prediction_dates_array, year)
-                
-                # Para cada día futuro a predecir
-                for i in range(days_to_predict):
-                    last_date = df["Fecha"].iloc[-1]
-                    correct_prediction_date = last_date + pd.Timedelta(days=1)
-                    
-                    # Obtener el tipo de día para la fecha de predicción
-                    current_day_type = future_day_types[i]
-                    
-                    # Determinar la predicción basada en el tipo de día y convertir a float
-                    if "Sábado" in current_day_type:
-                        prediction = float(saturday_demand)
-                    elif "Domingo" in current_day_type or "festivo" in current_day_type:
-                        prediction = float(sunday_demand)
-                    else:
-                        prediction = float(ordinary_demand)
-                    
-                    predictions.append(prediction)
-                    new_row = pd.DataFrame({"Fecha": [correct_prediction_date], "P": [prediction]})
-                    df = pd.concat([df, new_row], ignore_index=True)
-
-            print(df)
+            predictions = self._predict_daily_with_xgb(
+                search=search,
+                db=db,
+                all_dates=all_dates,
+                historic_demands=historic_demands,
+                prediction_dates=prediction_dates_array,
+                temp_data=temp_data,
+            )
             
             if current_month_dates:
                 month_reference_date = current_month_dates[0]
@@ -1009,7 +1094,7 @@ class MPMService:
             for ciudad in ciudades_principales:
                 try:
                     city_data = climate.get_climate_daily_all_types_per_city(db=db, search=search_temp_cities, city=ciudad)
-                    
+
                     # Encontrar el índice de inicio en los datos de la ciudad
                     city_start_index = 0
                     if all_dates_complete and city_data["fechas"]:
@@ -1156,12 +1241,57 @@ class MPMExcelGenerator:
             # Obtener predicciones de los 4 métodos
             predictions_data = {}
             method_names = {
-                1: "Solo Demanda",
-                2: "Una Temperatura", 
-                3: "Tres Temperaturas",
-                4: "Promedio"
+                1: "Días similares (f3)",
+                2: "Ajuste clima BAQ (calibrado/surrogate)",
+                3: "Ajuste clima 3C (calibrado/surrogate)",
+                4: "Promedios por tipo de día"
             }
             
+            # División de mercado: histórico real se ajusta por fecha exacta; predicciones y total
+            # se ajustan parejo porque el modelo no conoce la fecha límite. Se extraen valores
+            # planos (no el objeto) porque el bucle de abajo llama a mpm_service.predict() para 4
+            # métodos sobre la misma sesión.
+            _demand_config_row = DemandConfigService().get_config(db)
+            demand_config_factor = (_demand_config_row.porcentaje or 0) / 100.0
+            demand_config_cutoff = datetime.combine(_demand_config_row.fecha_limite, datetime.min.time().replace(hour=23, minute=59, second=59))
+
+            def _to_datetime(value):
+                # Import local (no el `date` del módulo): más abajo, en esta misma función, hay un
+                # `for i, date in enumerate(all_dates)` que convierte `date` en variable local;
+                # referenciar el `date` global desde este closure falla en ejecución.
+                from datetime import date as _date_cls
+                if isinstance(value, datetime):
+                    return value
+                if isinstance(value, _date_cls):
+                    return datetime.combine(value, datetime.min.time())
+                if isinstance(value, str):
+                    try:
+                        return datetime.strptime(value[:10], "%Y-%m-%d")
+                    except ValueError:
+                        return None
+                return None
+
+            def _apply_demand_split(result):
+                if not result:
+                    return result
+                dates = result.get("dates") or []
+                if "historic_demands" in result and result["historic_demands"]:
+                    scaled = []
+                    for i, v in enumerate(result["historic_demands"]):
+                        fecha = _to_datetime(dates[i]) if i < len(dates) else None
+                        if v is not None and fecha is not None and fecha <= demand_config_cutoff:
+                            scaled.append(v * demand_config_factor)
+                        else:
+                            scaled.append(v)
+                    result["historic_demands"] = scaled
+                if "prediction" in result and result["prediction"]:
+                    result["prediction"] = [
+                        (v * demand_config_factor) if v is not None else v for v in result["prediction"]
+                    ]
+                if result.get("total_predictions") is not None:
+                    result["total_predictions"] = result["total_predictions"] * demand_config_factor
+                return result
+
             # Para cada método, obtener las predicciones
             for method_id in [1, 2, 3, 4]:
                 search = MPMPredictSchema(
@@ -1174,6 +1304,7 @@ class MPMExcelGenerator:
                 try:
                     # CORRECCIÓN: Cambiar mmp_service por mpm_service
                     result = mpm_service.predict(search, db)
+                    result = _apply_demand_split(result)
                     predictions_data[method_id] = result
                     print(f"Método {method_id} - Datos obtenidos correctamente")
                     if result:
@@ -1241,10 +1372,10 @@ class MPMExcelGenerator:
             headers = [
                 "Fecha", 
                 "Histórico/Predicción", 
-                "Método 1\nSolo Demanda\n(MW)", 
-                "Método 2\nUna Temperatura\n(MW)", 
-                "Método 3\nTres Temperaturas\n(MW)", 
-                "Método 4\nPromedio\n(MW)", 
+                f"Método 1\n{method_names[1]}\n(MW)",
+                f"Método 2\n{method_names[2]}\n(MW)",
+                f"Método 3\n{method_names[3]}\n(MW)",
+                f"Método 4\n{method_names[4]}\n(MW)",
                 "Promedio\nMétodos\n(MW)"
             ]
             
@@ -1328,18 +1459,20 @@ class MPMExcelGenerator:
             
             # Fila de totales en español
             total_row = current_row + 1
-            ws.cell(row=total_row, column=1, value="TOTAL (MW)")
+            # total_predictions viene como GW * 1e6, por lo que al dividir entre
+            # WATTS_TO_MW la fila TOTAL queda en GW (las columnas diarias son MW).
+            ws.cell(row=total_row, column=1, value="TOTAL (GW)")
             ws.cell(row=total_row, column=1).font = Font(bold=True)
             
-            # Calcular totales para cada método en MW
+            # Calcular totales para cada método en GW
             for method_id in [1, 2, 3, 4]:
                 col = method_id + 2  # +2 por la columna extra
                 try:
                     if predictions_data[method_id] and 'total_predictions' in predictions_data[method_id]:
                         total_in_watts = float(predictions_data[method_id]['total_predictions'])
-                        total_in_mw = total_in_watts / WATTS_TO_MW
-                        ws.cell(row=total_row, column=col, value=total_in_mw)
-                        print(f"Total método {method_id}: {total_in_mw} MW")
+                        total_in_gw = total_in_watts / WATTS_TO_MW
+                        ws.cell(row=total_row, column=col, value=total_in_gw)
+                        print(f"Total método {method_id}: {total_in_gw} GW")
                     else:
                         ws.cell(row=total_row, column=col, value="N/D")  # "No Disponible" en español
                         print(f"Método {method_id}: Sin datos de total")
@@ -1350,9 +1483,11 @@ class MPMExcelGenerator:
             # Total del promedio
             try:
                 if daily_averages and len(daily_averages) > 0:
-                    total_average = sum(daily_averages)
+                    # Los promedios diarios están en MW; se pasan a GW para que
+                    # toda la fila TOTAL comparta unidad.
+                    total_average = sum(daily_averages) / 1_000
                     ws.cell(row=total_row, column=7, value=total_average)
-                    print(f"Total promedio: {total_average} MW")
+                    print(f"Total promedio: {total_average} GW")
                 else:
                     ws.cell(row=total_row, column=7, value="N/D")  # "No Disponible" en español
                     print("No hay datos para calcular el promedio total")
@@ -1383,10 +1518,10 @@ class MPMExcelGenerator:
             ws.cell(row=note_row, column=1, value="NOTAS:")
             ws.cell(row=note_row, column=1).font = Font(bold=True)
             
-            ws.cell(row=note_row + 1, column=1, value="• Método 1: Predicción basada únicamente en datos históricos de demanda")
-            ws.cell(row=note_row + 2, column=1, value="• Método 2: Predicción con datos de demanda y una temperatura promedio")
-            ws.cell(row=note_row + 3, column=1, value="• Método 3: Predicción con demanda y temperaturas de tres ciudades (Bolívar, Barranquilla, Cesar)")
-            ws.cell(row=note_row + 4, column=1, value="• Método 4: Predicción basada en promedios por tipo de día (Laboral/Sábado/Domingo-Festivo)")
+            ws.cell(row=note_row + 1, column=1, value="• Método 1: Días similares (f3)")
+            ws.cell(row=note_row + 2, column=1, value="• Método 2: Ajuste clima BAQ (calibrado/surrogate)")
+            ws.cell(row=note_row + 3, column=1, value="• Método 3: Ajuste clima 3C (calibrado/surrogate)")
+            ws.cell(row=note_row + 4, column=1, value="• Método 4: Promedios por tipo de día")
             ws.cell(row=note_row + 5, column=1, value="• Los valores están expresados en Megavatios (MW)")
             
             # Ajustar ancho para las notas

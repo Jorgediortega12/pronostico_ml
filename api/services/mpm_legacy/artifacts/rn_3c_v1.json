@@ -1,0 +1,19 @@
+{
+  "version": "v1",
+  "type": "linear_3c",
+  "intercept": -0.01963,
+  "coef_baq": 0.22527435,
+  "coef_car": 0.22527435,
+  "coef_sm": 0.33842558,
+  "prior": {
+    "slope": 1.099,
+    "intercept": -0.01963
+  },
+  "train_meta": {
+    "n_pairs": 3703,
+    "source": "Combined_Demanda_Clima.csv",
+    "filters": "weekday<5 sin festivos Colombia (holidays_co)",
+    "method": "nonnegative_ridge_to_linear_prior_baq_equals_car",
+    "mapping": "Baq=t_CTG; Car=t_CTG (degenerada); SM=t_VDP; t_MON solo matching"
+  }
+}
