@@ -41,6 +41,25 @@ El backend Node debe apuntar a este servicio (ya lo hace por defecto):
 `DEMANDA_ML_PORT=8000`, y `DEMANDA_ML_USER` / `DEMANDA_ML_PASSWORD` deben coincidir
 con `ML_SERVICE_USER` / `ML_SERVICE_PASSWORD` de este `.env`.
 
+## Base de datos por petición (multi-empresa)
+
+Una sola instancia del ML atiende a todas las empresas. Cada petición del backend trae el `database_url` de la empresa con
+la que inició sesión el usuario, y el ML consulta ESA base:
+
+- POST: campo `database_url` del cuerpo JSON. GET: parámetro `?database_url=...`. También se acepta el encabezado `X-Database-Url`
+  (tiene prioridad sobre los otros dos).
+- Hay un motor de conexión por base (en caché, máximo `ML_MAX_DB_ENGINES`, 32 por defecto).
+- Si la petición no trae `database_url`, se usa la base del `.env` (`ML_DATABASE_URL` o `POSTGRES_*`): útil en desarrollo.
+
+Variables opcionales (recomendadas en producción):
+
+| Variable | Efecto |
+|---|---|
+| `ML_REQUIRE_DATABASE_URL=1` | Rechaza (400) las peticiones sin `database_url`, en vez de caer en la base del `.env`. |
+| `ML_ALLOWED_DB_HOSTS=host:puerto,host:puerto` | Solo acepta bases en esos servidores (por ejemplo `gacademic.jmdatalabs.co:5432,localhost:5432`). |
+
+Los errores de `database_url` no incluyen la URL (trae usuario y contraseña).
+
 ## Pendientes / caveats
 
 - **`GMR_last_demand_document`** y **`GMR_session`**: estas dos tablas NO existen en el
