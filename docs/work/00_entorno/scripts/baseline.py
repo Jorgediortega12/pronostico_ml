@@ -62,7 +62,7 @@ def run_model(db, model_id, start, end, raw: bool):
     orig_cap, orig_ovr = fc.cap_xgb_sarimax_error, fc.apply_known_month_overrides
     if raw:
         fc.cap_xgb_sarimax_error = lambda df, **k: df
-        fc.apply_known_month_overrides = lambda df, **k: df
+        fc.apply_known_month_overrides = lambda df, **k: df.assign(override_aplicado=False)
     try:
         search = ForecastSchema(id=model_id, user_id=1, session_id=1, start_date=start, end_date=end)
         buf = io.StringIO()
