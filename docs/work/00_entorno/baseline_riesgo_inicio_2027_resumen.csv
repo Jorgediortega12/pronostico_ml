@@ -1,0 +1,11 @@
+serie,pre_corte_n,pre_corte_MAPE,pre_corte_sesgo,pre_corte_max_abs,post_corte_n,post_corte_MAPE,post_corte_sesgo,post_corte_max_abs,todo_n,todo_MAPE,todo_sesgo,todo_max_abs,anual_pre_corte_err%
+RF_crudo,0,,,,0,,,,0,,,,
+RF_tope,0,,,,0,,,,0,,,,
+XGB_crudo,0,,,,0,,,,0,,,,
+XGB_tope,0,,,,0,,,,0,,,,
+SARIMAX_crudo,0,,,,0,,,,0,,,,
+SARIMAX_tope,0,,,,0,,,,0,,,,
+CLIMA_ONI_crudo,0,,,,0,,,,0,,,,
+CLIMA_ONI_tope,0,,,,0,,,,0,,,,
+NAIVE_EST,0,,,,0,,,,0,,,,
+NAIVE_EST_DRIFT,0,,,,0,,,,0,,,,

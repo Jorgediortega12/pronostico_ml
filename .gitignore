@@ -9,3 +9,8 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# respaldo local de modelos originales (ya en historial git)
+docs/work/backup_modelos_originales/
+Test_screenshots/
+afinia2.backup
