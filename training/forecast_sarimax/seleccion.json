@@ -1,0 +1,13 @@
+{
+  "nombre": "SARIMA(1,0,0)(0,1,1,12)+c log(demanda diaria media) v2",
+  "components": [
+    {"kind": "sarima", "order": [1, 0, 0], "seasonal_order": [0, 1, 1, 12], "trend": "c",
+     "transform": "log_daily", "covid": "none", "exog": [], "damped": true}
+  ],
+  "weights": [1.0],
+  "criterio": "Menor MAPE walk-forward (orígenes mensuales 2017-12..2023-12, h=24, reales <= 2025-12, sin COVID) entre 70+ candidatos (s1 AIC/BIC train<=2023-12; s2 órdenes x transform x COVID; s2b vecinos d=0; s3 exógenas calendario; ensamble con ETS). Empate práctico con (2,0,0): se elige el más parsimonioso. Exógenas de calendario y ensamble no mejoran. 2026 no se usó.",
+  "metricas": {
+    "seleccion_mape": 4.043, "seleccion_mape_h1_12": 3.721, "seleccion_mape_h13_24": 4.365, "seleccion_mape_anual": 2.983,
+    "naive_drift_mape": 6.572, "original_reajustado_mape": 7.600
+  }
+}

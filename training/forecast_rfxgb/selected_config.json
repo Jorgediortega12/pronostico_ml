@@ -1,0 +1,17 @@
+{
+  "_doc": "Elegido por walk-forward con orígenes 2017-12..2023-12 cada 3 meses, h=1..24 (objetivos <= 2025-12). Ver docs/work/02_rfxgb/seleccion_resumen.csv. Mejor config de cada algoritmo por MAPE mensual.",
+  "rf": {
+    "name": "rf_v2",
+    "offset": "nivel_estacional",
+    "params": {"n_estimators": 300, "min_samples_leaf": 20, "max_features": 0.5},
+    "exclude_targets": [["2020-03", "2021-02"]],
+    "h_train": 36
+  },
+  "xgb": {
+    "name": "xgb_v2",
+    "offset": "nivel_estacional",
+    "params": {"n_estimators": 300, "max_depth": 2, "min_child_weight": 5, "learning_rate": 0.03},
+    "exclude_targets": [],
+    "h_train": 36
+  }
+}

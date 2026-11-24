@@ -1,0 +1,16 @@
+{
+  "extra_features": [
+    "oni_mean_anio"
+  ],
+  "oni_source": "observado",
+  "window_years": 5,
+  "exclude_years": [
+    2020,
+    2021,
+    2022
+  ],
+  "alpha": 0.0,
+  "nonneg_oni": true,
+  "beta_all_history": true,
+  "n_years_shape": 2
+}

@@ -1,0 +1,86 @@
+{
+  "version": 2,
+  "model_id": 2,
+  "model_name": "xgboost",
+  "features": [
+    "h",
+    "k",
+    "mes",
+    "m_sin",
+    "m_cos",
+    "dias_t",
+    "lab_t",
+    "sab_t",
+    "domfest_t",
+    "d_dias",
+    "d_lab",
+    "d_sab",
+    "d_domfest",
+    "base_dev",
+    "si_mean",
+    "g12",
+    "g3",
+    "g36",
+    "drift",
+    "g_since_b",
+    "off_gap"
+  ],
+  "offset": "nivel_estacional",
+  "h_train": 36,
+  "params": {
+    "n_estimators": 300,
+    "max_depth": 2,
+    "min_child_weight": 5,
+    "learning_rate": 0.03
+  },
+  "exclude_targets": [],
+  "train_first_month": "2011-01",
+  "train_last_month": "2026-08",
+  "n_train_rows": 4410,
+  "entrenado": "2026-11-23T23:50:38",
+  "fuente": "BD PRONOSTICO_demands via training.common.data (dedupe 2020-Q4, 2021-09 imputado)",
+  "quiebre_mercado": {
+    "fecha_limite": "2026-09-01",
+    "porcentaje": 100.0,
+    "primer_mes_post": "2026-09"
+  },
+  "seleccion": "walk-forward orígenes 2017-12..2023-12 (objetivos <= 2025-12); ver docs/work/02_rfxgb",
+  "metricas_walkforward": {
+    "n_origenes": 97,
+    "n": 1880,
+    "mape": 5.519976119293429,
+    "sesgo": 0.749045575302539,
+    "max_ape": 20.45914463252856,
+    "mape_h1_12": 5.332411521571952,
+    "sesgo_h1_12": 0.8494226126488379,
+    "n_h1_12": 998,
+    "mape_h13_24": 5.732209076805939,
+    "sesgo_h13_24": 0.6354670228404014,
+    "n_h13_24": 882,
+    "n_anual": 66,
+    "mape_anual": 5.122488246040515,
+    "sesgo_anual": 1.005289253743051,
+    "mape_anual_h1_12": 3.948191809318743,
+    "mape_anual_h13_24": 5.239917889712691
+  },
+  "python": "3.11.5",
+  "unidad": "kWh, escala mercado completo",
+  "nota_metricas": {
+    "aviso": "La cifra de seleccion NO es fuera de muestra: los objetivos <=2025-12 se usaron para elegir la spec. Solo los objetivos >=2026-01 (n=164) son fuera de muestra pura.",
+    "seleccion_mape": 5.52,
+    "seleccion_ventana": "walk-forward origenes 2017-12..2023-12 (objetivos <=2025-12)",
+    "post_seleccion_objetivos_hasta_2025_12": {
+      "n": 276,
+      "mape": 6.29,
+      "naive_drift_mape": 4.24,
+      "nota": "origenes 2024-01..2025-12; objetivos ya vistos en la seleccion"
+    },
+    "objetivos_desde_2026_01_oos_puro": {
+      "n": 164,
+      "mape": 5.79,
+      "naive_drift_mape": 5.4,
+      "nota": "origenes 2024-01..2025-12, h<=24, objetivos 2026-01..2026-08 (pre-division)"
+    },
+    "fuente": "docs/work/07_correcciones_r2/REPORTE.md (recalculado de los *_detalle.csv.gz de docs/work)"
+  }
+}

@@ -496,8 +496,15 @@ def test_predict_future_climate_single_month_sensitivity_spread_is_meaningful(pr
     barrido (k_light=3) fue 3.11%; aquí se usa un umbral bajo el promedio
     real medido para estos casos concretos (~2.87%) para no ser frágil
     ante variación entre entornos, pero muy por encima del ~1% del bug
-    original -- documenta que se recuperó sensibilidad real."""
-    UMBRAL_SPREAD_PROMEDIO_PCT = 2.0
+    original -- documenta que se recuperó sensibilidad real.
+
+    Recalibrado 2026-11-23 (agente-clima, docs/work/04_clima/REPORTE.md §Escenarios): el ~2.9 % previo
+    venía en gran parte de datos corruptos (2020-Q4 deflactado ~50 % en dataset_mensual.csv → shares
+    de oct-dic 2020 —año NIÑA— artificialmente bajos). Con la capa de datos limpia, el mismo k_light=3
+    da 0.71 % de spread medio en estos 8 casos y el shrinkage agresivo del bug (k=85) da 0.30 %
+    (k=20: 0.42 %). El umbral 0.5 % sigue separando k_light=3 del shrinkage agresivo (que es lo que
+    este test protege) sin depender del artefacto de datos."""
+    UMBRAL_SPREAD_PROMEDIO_PCT = 0.5
 
     last_hist = int(predictor.climate_hist_annual["year"].max())
     cutoff_years = [last_hist - 1, last_hist - 3]

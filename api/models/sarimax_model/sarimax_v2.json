@@ -1,0 +1,76 @@
+{
+  "components": [
+    {
+      "spec": {
+        "kind": "sarima",
+        "order": [
+          1,
+          0,
+          0
+        ],
+        "seasonal_order": [
+          0,
+          1,
+          1,
+          12
+        ],
+        "trend": "c",
+        "transform": "log_daily",
+        "covid": "none",
+        "exog": [],
+        "damped": true
+      },
+      "params": [
+        0.01624960282789874,
+        0.7159105233636816,
+        -0.6335365513878788,
+        0.000854049141995345
+      ],
+      "param_names": [
+        "intercept",
+        "ar.L1",
+        "ma.S.L12",
+        "sigma2"
+      ],
+      "aic": -729.1521028284951
+    }
+  ],
+  "weights": [
+    1.0
+  ],
+  "train_end": "2026-08",
+  "version": "2",
+  "metadata": {
+    "nombre": "SARIMA(1,0,0)(0,1,1,12)+c log(demanda diaria media) v2",
+    "creado": "2026-11-23T23:40:39",
+    "datos": "PRONOSTICO_demands limpia (training.common.data): dedupe 2020-Q4, 2021-09 imputado, corte en quiebre de mercado 2026-09",
+    "escala": "mercado completo (kWh); el llamador aplica el factor de división de mercado",
+    "seleccion": "Menor MAPE walk-forward (orígenes mensuales 2017-12..2023-12, h=24, reales <= 2025-12, sin COVID) entre 70+ candidatos (s1 AIC/BIC train<=2023-12; s2 órdenes x transform x COVID; s2b vecinos d=0; s3 exógenas calendario; ensamble con ETS). Empate práctico con (2,0,0): se elige el más parsimonioso. Exógenas de calendario y ensamble no mejoran. 2026 no se usó.",
+    "metricas_walkforward": {
+      "seleccion_mape": 4.043,
+      "seleccion_mape_h1_12": 3.721,
+      "seleccion_mape_h13_24": 4.365,
+      "seleccion_mape_anual": 2.983,
+      "naive_drift_mape": 6.572,
+      "original_reajustado_mape": 7.6
+    },
+    "nota_metricas": {
+      "aviso": "La cifra de seleccion NO es fuera de muestra: los objetivos <=2025-12 se usaron para elegir la spec. Solo los objetivos >=2026-01 (n=164) son fuera de muestra pura.",
+      "seleccion_mape": 4.043,
+      "seleccion_ventana": "walk-forward origenes 2017-12..2023-12, h=24 (objetivos <=2025-12)",
+      "post_seleccion_objetivos_hasta_2025_12": {
+        "n": 276,
+        "mape": 4.19,
+        "naive_drift_mape": 4.24,
+        "nota": "origenes 2024-01..2025-12; objetivos ya vistos en la seleccion"
+      },
+      "objetivos_desde_2026_01_oos_puro": {
+        "n": 164,
+        "mape": 4.03,
+        "naive_drift_mape": 5.4,
+        "nota": "origenes 2024-01..2025-12, h<=24, objetivos 2026-01..2026-08 (pre-division)"
+      },
+      "fuente": "docs/work/07_correcciones_r2/REPORTE.md (recalculado de los *_detalle.csv.gz de docs/work)"
+    }
+  }
+}

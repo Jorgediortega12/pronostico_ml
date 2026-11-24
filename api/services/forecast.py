@@ -36,17 +36,176 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 import joblib
 import warnings
+import logging
+import os
 from ..other_models.demand import MonthlyDemand, Demand, YearlyDemand, TypeYear
 from api.services import sarimax_macro_constante
 from api.services.demand_config_service import DemandConfigService, adjust_period_value
-from api.services.forecast_adjustments import apply_ipc_adjustment, apply_known_month_overrides, cap_xgb_sarimax_error
+from api.services.forecast_adjustments import (
+    apply_ipc_adjustment,
+    apply_known_month_overrides,
+    cap_xgb_sarimax_error,
+    front_scale_pct_error,
+)
 warnings.filterwarnings('ignore')
 
-# Soporte para el modelo climático + ONI (id=4). Import defensivo: si el
-# paquete `training` no está disponible en el entorno de despliegue, las
-# ramas nuevas (model_path.endswith('climate_model/')) fallarán con un
-# mensaje claro en tiempo de uso, sin romper la carga del módulo ni afectar
-# a los modelos id=1/2/3 existentes.
+logger = logging.getLogger(__name__)
+
+
+def _use_legacy_models() -> bool:
+    """Rollback PARCIAL de emergencia: ``ML_FORECAST_LEGACY=1`` vuelve solo a la **inferencia** anterior de
+    id 1/2/3 (Lasso anual + RF/XGB y SARIMAX(5,1,6) serializados, con sus variables macro).
+
+    NO revierte el resto de cambios de la rama v2: el post-proceso (tope solo en meses elegibles, override solo
+    con real coincidente, errores en la escala del front, real mensual con el mes completo), los campos nuevos
+    de la respuesta y el id 4 (artefactos v2) siguen siendo los nuevos. La respuesta NO es equivalente a la de
+    ``main``; para volver exactamente a ``main`` hay que desplegar ese commit. Por defecto se usan los v2."""
+    return os.getenv("ML_FORECAST_LEGACY", "").strip().lower() in ("1", "true", "si", "sí")
+
+
+def _months_between(a: pd.Timestamp, b: pd.Timestamp) -> int:
+    return (b.year - a.year) * 12 + (b.month - a.month)
+
+
+def _month_ts(value) -> pd.Timestamp:
+    if value is None:
+        return pd.Timestamp.max.to_period("M").to_timestamp()
+    return pd.Timestamp(value).to_period("M").to_timestamp()
+
+
+def contract_month_labels(fechas: pd.Series, model_id: int) -> list:
+    """Etiquetas ``monthly_predictions.fechas`` con el formato de ``main`` (contrato del front).
+
+    ids 1/2/3: FIN de mes (``main`` usaba ``pd.date_range(freq='M')``, p. ej. ``2026-01-31``); id 4: INICIO de
+    mes (``2026-01-01``). Internamente todo se calcula por inicio de mes; solo la salida se re-etiqueta (es
+    idempotente para fechas que ya son fin de mes, como las de la rama legacy).
+    """
+    fechas = pd.to_datetime(pd.Series(fechas))
+    if model_id in (1, 2, 3):
+        fechas = fechas.dt.to_period('M').dt.to_timestamp(how='end').dt.normalize()
+    return fechas.dt.strftime('%Y-%m-%d').tolist()
+
+
+def predict_v2_full_scale(model_id: int, hist_serie: pd.Series, start_m: pd.Timestamp,
+                          end_m: pd.Timestamp, corte=None) -> tuple:
+    """Pronóstico v2 (ids 1/2/3) en escala de mercado completo, desde el mes siguiente al último real usable
+    anterior a ``start_m`` hasta ``end_m`` (inclusive).
+
+    Devuelve ``(forecast, historia_previa, info)``: ``forecast`` es una Serie (kWh) indexada por inicio de mes
+    que también cubre los meses entre el último real y ``start_m`` (necesarios para totales anuales), e
+    ``historia_previa`` son los reales usados (< ``start_m``, < ``corte``).
+    """
+    from api.services import forecast_rfxgb, forecast_sarimax
+
+    hist = hist_serie[hist_serie.index < start_m]
+    if corte is not None:
+        hist = hist[hist.index < corte]
+    if hist.empty:
+        raise ValueError(f"No hay histórico de demanda utilizable antes de {start_m:%Y-%m}")
+    last = hist.index.max()
+    fc_start = last + pd.offsets.MonthBegin(1)
+    if fc_start > end_m:
+        raise ValueError("Rango de pronóstico vacío")
+    if model_id in (1, 2):
+        art = forecast_rfxgb.load_artifact(model_id)
+        refit = _month_ts(art.get("train_last_month")) >= fc_start
+        if refit:
+            # Hindcast: el artefacto vio meses >= fc_start -> se re-entrena con la historia disponible (misma
+            # config) para que el error mostrado sea fuera de muestra (igual que SARIMAX refit="auto").
+            art = forecast_rfxgb.refit_from_artifact_cached(
+                model_id, hist, art, fingerprint=forecast_rfxgb.artifact_fingerprint(model_id))
+        df = forecast_rfxgb.predict_monthly(model_id, hist, fc_start, end_m, market_break_month=corte, artifact=art)
+        fc = pd.Series(df["demanda_mercado_completo_kwh"].to_numpy(dtype=float),
+                       index=pd.DatetimeIndex(df["fecha"]))
+        info = {"nombre": df.attrs.get("model_name"), "entrenado_hasta": art.get("train_last_month"),
+                "reestimado": bool(refit)}
+    elif model_id == 3:
+        df = forecast_sarimax.predict_monthly(hist, fc_start, end_m, exclude_from=corte)
+        fc = pd.Series(df["prediccion"].to_numpy(dtype=float), index=pd.DatetimeIndex(df["fecha"]))
+        info = {"nombre": df.attrs.get("modelo"), "reestimado": bool(df.attrs.get("refit"))}
+    else:
+        raise ValueError(f"Modelo v2 no soportado: id={model_id}")
+    expected = _months_between(fc_start, end_m) + 1
+    if len(fc) != expected or not np.isfinite(fc.to_numpy()).all() or (fc.to_numpy() <= 0).any():
+        raise ValueError("El modelo devolvió un pronóstico incompleto o no finito")
+    info.update({"version": "v2", "ultimo_mes_historia": f"{last:%Y-%m}",
+                 "corte_division": f"{corte:%Y-%m}" if corte is not None else None})
+    return fc, hist, info
+
+
+def v2_internal_gaps(hist_prev: pd.Series) -> pd.DatetimeIndex:
+    """Meses sin real usable dentro del año del último real (enero .. último mes), p. ej. un mes con menos del
+    50 % de días que no se imputó. Sin rellenarlos, el total anual de ese año no tendría 12 meses."""
+    if hist_prev.empty:
+        return pd.DatetimeIndex([])
+    last = hist_prev.index.max()
+    months = pd.date_range(pd.Timestamp(year=last.year, month=1, day=1), last, freq="MS")
+    return months.difference(hist_prev.index)
+
+
+def v2_annual_totals(years: dict, hist_prev: pd.Series, fc: pd.Series, years_to_predict, start_m: pd.Timestamp,
+                     gap_fill: pd.Series = None) -> tuple:
+    """Totales anuales en escala de mercado completo para la rama v2.
+
+    Años pedidos = reales previos a ``start_m`` (+ pronóstico de huecos internos ``gap_fill``) + pronóstico del
+    resto. Años anteriores a ``start`` con meses sin real usable (incompleto, preliminar o post-división) se
+    completan con pronóstico solo para que ``growth`` compare en la misma escala.
+
+    Devuelve ``(years, anios_estimados, fijo_por_anio)``; ``fijo_por_anio[y]`` es la parte del total del año
+    pedido ``y`` que corresponde a meses anteriores a ``start_m`` (el ajuste IPC no la escala).
+    """
+    years = dict(years)
+    parts = [hist_prev]
+    if gap_fill is not None and len(gap_fill):
+        parts.append(gap_fill)
+    parts.append(fc)
+    full = pd.concat(parts).sort_index()
+    full = full[~full.index.duplicated(keep='first')]  # un real nunca se sustituye por pronóstico
+    last_hist = hist_prev.index.max()
+    start_year = min(years_to_predict)
+    estimated, fixed = [], {}
+    for year in sorted(set(full.index.year)):
+        if year < last_hist.year:
+            continue
+        vals = full[full.index.year == year]
+        if len(vals) != 12:
+            continue
+        if year in years_to_predict:
+            years[year] = int(vals.sum())
+            fixed[year] = float(vals[vals.index < start_m].sum())
+        elif year < start_year and (vals.index > last_hist).any():
+            years[year] = int(vals.sum())
+            estimated.append(int(year))
+    missing = [y for y in years_to_predict if y not in years or not np.isfinite(years[y])]
+    if missing:
+        raise ValueError(f"No se pudo calcular el total anual de {missing}")
+    return years, estimated, fixed
+
+
+def run_v2_forecast(model_id: int, hist_serie: pd.Series, corte, start_m: pd.Timestamp, years_to_predict,
+                    years: dict) -> dict:
+    """Rama v2 completa (ids 1/2/3): pronóstico hasta diciembre del último año pedido, relleno de los huecos
+    internos del año del último real con el pronóstico del modelo (pronosticando desde el primer hueco) y
+    totales anuales.
+
+    Devuelve un dict con ``fc`` (Serie), ``years``, ``estimated_years``, ``fixed_by_year`` e ``info``.
+    """
+    fc_end = pd.Timestamp(year=max(years_to_predict), month=12, day=1)
+    fc, hist_prev, info = predict_v2_full_scale(model_id, hist_serie, start_m, fc_end, corte)
+    gaps = v2_internal_gaps(hist_prev)
+    gap_fill = None
+    if len(gaps):
+        fc_gap, _, _ = predict_v2_full_scale(model_id, hist_serie, gaps[0], gaps[-1], corte)
+        gap_fill = fc_gap.reindex(gaps)
+        info["meses_hueco_rellenados"] = [f"{m:%Y-%m}" for m in gaps]
+    years_out, estimated, fixed = v2_annual_totals(years, hist_prev, fc, years_to_predict, start_m, gap_fill)
+    return {"fc": fc, "years": years_out, "estimated_years": estimated, "fixed_by_year": fixed, "info": info}
+
+
+# Soporte para el modelo climático + ONI (id=4). Este import de `training.forecast_climate` es defensivo (si
+# falla, solo la rama id=4 falla en tiempo de uso). OJO: el paquete `training` es OBLIGATORIO de todas formas:
+# `forecast_history` (historia limpia de los modelos v2) importa `training.common` a nivel de módulo justo
+# debajo, sin try/except, así que sin `training/` este módulo no carga. El Dockerfile copia `./training`.
 try:
     import sys as _sys
     from pathlib import Path as _Path
@@ -63,6 +222,10 @@ except Exception as _climate_import_error:
     climate_apply_correctors = None
     climate_load_corrector_artifact = None
     print(f"[climate_model] No se pudo importar el soporte del modelo climático: {_climate_import_error}")
+
+# Historia limpia por petición (usa training.common; la raíz del backend ya está en sys.path arriba). Import
+# NO defensivo a propósito: sin `training/` la API falla al arrancar en vez de degradar en silencio.
+from api.services.forecast_history import division_from_config, load_clean_history_session  # noqa: E402
 
 # Medianas históricas de ONI por fase ENSO (dataset_mensual.csv). Usadas
 # cuando el cliente envía `enso_phase_by_month` para forzar la fase de un mes.
@@ -296,8 +459,8 @@ class DemandPredictor:
                 self.climate_annual_features = list(self.climate_annual_scaler_x.feature_names_in_)
                 self.climate_monthly_features = list(self.climate_monthly_model.feature_names_in_)
 
-                # Corrector post-predicción calibrado con datos reales
-                # (training/forecast_climate/calibrate_production_corrector.py).
+                # Corrector post-predicción calibrado con datos reales (artefacto
+                # postproc_corrector_v1.json; lo regenera training/forecast_climate/train_final_clima.py).
                 try:
                     self.climate_corrector = climate_load_corrector_artifact(f'{model_path}postproc_corrector_v1.json')
                 except Exception as corrector_error:
@@ -1616,6 +1779,20 @@ class ForecastService:
             # forecast_years/years_list/start_year no dependen de las variables
             # macro: se calculan siempre, incluso para el modelo climático
             # (id=4), que no necesita variables macro futuras.
+            if end_date.to_period('M') < start_date.to_period('M'):
+                raise ValueError("end_date debe ser posterior o igual a start_date")
+
+            # Modelos v2 (id 1/2/3) no usan variables macro; id 4 tampoco. Solo el camino legacy las pide.
+            use_v2 = search.id in (1, 2, 3) and not _use_legacy_models()
+            # División de mercado de la base de la petición (misma fuente y semántica que el front).
+            split_config = DemandConfigService().get_config(db)
+            division = division_from_config(split_config)
+            model_info = {"id": int(search.id), "version": "v2" if (use_v2 or search.id == 4) else "legacy"}
+            v2_estimated_years = []
+            # Rama v2: parte de cada total anual pedido que son reales previos a start (no la escala el IPC).
+            v2_fixed_by_year = None
+            v2_start_m = None
+
             print(f"Calculando años de pronóstico. start_date: {start_date}, end_date: {end_date}")
             forecast_years = end_date.year - start_date.year + 1
             years_list = []
@@ -1644,7 +1821,7 @@ class ForecastService:
             # futuro internamente) -- se omite todo este bloque para ese caso,
             # sin alterar el comportamiento para id=1/2/3.
 
-            if search.id != 4:
+            if search.id != 4 and not use_v2:
                 try:
                     print("Creando MacroeconomicService...")
                     macroeconomic = MacroeconomicService()
@@ -1804,7 +1981,7 @@ class ForecastService:
             # (id=4 no las necesita: se deja None, no se usa en esa rama)
             future_macro_vars = None
             _SARIMAX_MACRO_FALLBACK = False
-            if search.id != 4:
+            if search.id != 4 and not use_v2:
                 future_macro_vars = pd.DataFrame(
                     updated_variables,
                     index=years_list
@@ -1833,8 +2010,32 @@ class ForecastService:
             
             # Guardar el número de años que queremos predecir ANTES de llamar al modelo
             num_years_to_predict = len(years_to_predict)
-                
-            if search.id == 1 or search.id == 2:
+
+            if use_v2:
+                # Modelos v2 (ver docs/work/02_rfxgb y 03_sarimax): historia limpia de la base de la
+                # petición, cortada en la división de mercado, pronóstico en escala de mercado completo.
+                # Totales anuales: reales previos a start (+ pronóstico de huecos internos) + pronóstico del
+                # resto; años previos incompletos se completan con pronóstico solo para `growth` (no se toca
+                # annual_predictions histórico de la BD). Ver run_v2_forecast / v2_annual_totals.
+                hist = load_clean_history_session(db, division)
+                v2_start_m = start_date.to_period('M').to_timestamp()
+                v2 = run_v2_forecast(search.id, hist.serie, hist.corte, v2_start_m, years_to_predict, years)
+                model_info.update(v2["info"])
+                years = v2["years"]
+                v2_fixed_by_year = v2["fixed_by_year"]
+                v2_estimated_years.extend(v2["estimated_years"])
+                fc = v2["fc"]
+                monthly_predictions = pd.DataFrame({'fecha': fc.index, 'prediccion': fc.to_numpy()})
+
+                # (id 1/2: apply_ipc_adjustment lo recalcula más abajo sobre los totales ajustados)
+                years_list_full = sorted(list(years.keys()))
+                growth = {}
+                for i in range(1, len(years_list_full)):
+                    prev_y, cur_y = years_list_full[i - 1], years_list_full[i]
+                    if years.get(prev_y):
+                        growth[cur_y] = (years[cur_y] - years[prev_y]) / years[prev_y]
+
+            elif search.id == 1 or search.id == 2:
                 if search.id == 1:
                     model_path_name = 'api/models/rf_model/'
                 else:   
@@ -1930,12 +2131,30 @@ class ForecastService:
                     model_path_name = 'api/models/climate_model/'
                     predictor = DemandPredictor(model_path=model_path_name)
 
-                    # Como el original (GMR Atenea): NO excluir años atípicos del
-                    # histórico climático. El modelo se entrenó incluyéndolos
-                    # (training/forecast_climate/serialize_final_model.py no los
-                    # excluye); excluirlos vía GMR_type_year (ATIPICO 2020/2021)
-                    # desfasaba el resultado.
+                    # Como el original (GMR Atenea): NO excluir años atípicos (GMR_type_year,
+                    # ATIPICO 2020/2021) del histórico que ancla la inferencia: el lag-1 y el
+                    # reparto mensual necesitan la serie completa, y quitarlos desfasaba el
+                    # resultado. (El ajuste de coeficientes v2 ya omite 2020-2022 por su cuenta:
+                    # training/forecast_climate/clima_oni_v2_spec.json, exclude_years.)
                     atypical_years = []
+
+                    # Reparto mensual: promedio de los últimos 2 años completos (default de
+                    # predict_future_climate). El parche nys=5 se descartó: empata en el walk-forward total y es
+                    # peor en los orígenes posteriores a la selección (ver docs/work/04_clima/REPORTE.md y
+                    # docs/work/04_clima/forecast_clima_patch.md).
+                    climate_n_years_shape = 2
+                    model_info.update({"nombre": "clima_oni_v2", "n_years_shape": climate_n_years_shape})
+
+                    # El histórico climático (CSV) llega hasta last_real_year; el modelo emite los años
+                    # cutoff_year+1.. con cutoff_year <= last_real_year. Si el primer año pedido está más allá
+                    # de last_real_year+1 las etiquetas no corresponderían a los años pedidos.
+                    last_real_year = predictor._last_real_year(atypical_years=atypical_years)
+                    if cutoff_year > last_real_year:
+                        raise ValueError(
+                            f"El modelo climático (id=4) solo puede pronosticar a partir de {last_real_year + 1} "
+                            f"(su histórico llega a {last_real_year}); el año de inicio pedido es {start_year}. "
+                            f"Use una fecha de inicio <= {last_real_year + 1}-12-31."
+                        )
 
                     # Hindcast/forecast honesto: predecir los años del
                     # usuario usando solo histórico con year <= start_year-1.
@@ -1952,6 +2171,7 @@ class ForecastService:
                         atypical_years=atypical_years,
                         cutoff_year=cutoff_year,
                         enso_phase_by_month=getattr(search, 'enso_phase_by_month', None),
+                        n_years_shape=climate_n_years_shape,
                     )
 
                     # VALIDACIÓN: Verificar que tengamos el número correcto de predicciones
@@ -1969,7 +2189,6 @@ class ForecastService:
                     # una segunda llamada "genuina" anclada en last_real_year
                     # solo para los años > last_real_year, y se empalma su
                     # resultado sobre el de la llamada hindcast de arriba.
-                    last_real_year = predictor._last_real_year(atypical_years=atypical_years)
                     needs_genuine_forecast_splice = (
                         start_year <= last_real_year and max(years_to_predict) > last_real_year
                     )
@@ -1981,20 +2200,24 @@ class ForecastService:
                             atypical_years=atypical_years,
                             cutoff_year=last_real_year,
                             enso_phase_by_month=getattr(search, 'enso_phase_by_month', None),
+                            n_years_shape=climate_n_years_shape,
                         )
 
-                    # Calcular crecimiento usando los años correctos
+                    # Calcular crecimiento usando los años correctos (annual_pred es (n, 1): se aplana para
+                    # convertir cada total a escalar sin DeprecationWarning de numpy).
+                    annual_flat = np.asarray(annual_predictions, dtype=float).ravel()
                     for i, year in enumerate(years_to_predict):
-                        if i < len(annual_predictions):
-                            years[year] = int(annual_predictions[i])
+                        if i < len(annual_flat):
+                            years[year] = int(annual_flat[i])
                         else:
                             print(f"ADVERTENCIA: No hay predicción para el año {year}")
 
                     if needs_genuine_forecast_splice:
+                        genuine_flat = np.asarray(genuine_annual_predictions, dtype=float).ravel()
                         genuine_years_to_predict = [y for y in years_to_predict if y > last_real_year]
                         for i, year in enumerate(genuine_years_to_predict):
-                            if i < len(genuine_annual_predictions):
-                                years[year] = int(genuine_annual_predictions[i])
+                            if i < len(genuine_flat):
+                                years[year] = int(genuine_flat[i])
 
                         genuine_monthly = genuine_monthly_predictions[['fecha', 'prediccion']].copy()
                         keep_mask = monthly_predictions['fecha'].dt.year <= last_real_year
@@ -2002,6 +2225,38 @@ class ForecastService:
                             [monthly_predictions.loc[keep_mask, ['fecha', 'prediccion']], genuine_monthly],
                             ignore_index=True,
                         ).sort_values('fecha').reset_index(drop=True)
+
+                    # Año previo al pedido incompleto en la base (p. ej. 2026 con sep-oct post-división y
+                    # nov preliminar cuando start=2027-01): `years` trae el total parcial de la BD y el
+                    # `growth` del primer año pedido salía ~+45 %. Se estima en escala de mercado completo con
+                    # los reales limpios observados / participación de esos meses en el reparto del modelo.
+                    # Si el año previo no tiene ningún real usable (todo post-división o sin datos), se usa el
+                    # pronóstico completo del modelo para ese año (como la rama v2).
+                    try:
+                        prev_year = start_year - 1
+                        if prev_year in years and prev_year not in years_to_predict:
+                            hist_c = load_clean_history_session(db, division).serie
+                            obs = hist_c[hist_c.index.year == prev_year]
+                            if len(obs) == 0:
+                                prev_annual, _ = predictor.predict_future_climate(
+                                    forecast_years=1,
+                                    atypical_years=atypical_years,
+                                    cutoff_year=prev_year - 1,
+                                    n_years_shape=climate_n_years_shape,
+                                )
+                                years[prev_year] = int(np.asarray(prev_annual, dtype=float).ravel()[0])
+                                v2_estimated_years.append(int(prev_year))
+                            elif len(obs) < 12:
+                                first_pred_year = monthly_predictions['fecha'].dt.year.min()
+                                shape = monthly_predictions[monthly_predictions['fecha'].dt.year == first_pred_year]
+                                shares = (shape.set_index(shape['fecha'].dt.month)['prediccion']
+                                          / shape['prediccion'].sum())
+                                share_obs = float(shares.reindex(obs.index.month).sum())
+                                if len(shape) == 12 and 0 < share_obs < 1:
+                                    years[prev_year] = int(obs.sum() / share_obs)
+                                    v2_estimated_years.append(int(prev_year))
+                    except Exception as est_error:  # solo afecta a `growth`; nunca rompe la predicción
+                        logger.warning("[climate_model] No se pudo estimar el año %s: %s", start_year - 1, est_error)
 
                     years_list_full = sorted(list(years.keys()))
                     growth = {}
@@ -2037,6 +2292,10 @@ class ForecastService:
                     monthly_predictions=monthly_predictions[['fecha', 'prediccion']],
                     ipc_growth_by_year=getattr(search, 'ipc_growth_by_year', None),
                     years_to_predict=years_to_predict,
+                    # v2: el factor solo escala la parte pronosticada (meses >= start); los reales previos
+                    # del año pedido (start a mitad de año) quedan fijos. Legacy: sin cambios (None).
+                    fixed_by_year=v2_fixed_by_year,
+                    adjust_from=v2_start_m,
                 )
             else:
                 # El ajuste IPC solo aplica a id=1 (RF) e id=2 (XGBoost).
@@ -2048,18 +2307,19 @@ class ForecastService:
                 # por el código posterior (monthly_predictions_df, etc.).
                 monthly_predictions = monthly_predictions[['fecha', 'prediccion']]
 
-            # Override manual de meses históricos con anomalía puntual ya
-            # documentada (ver KNOWN_MONTH_OVERRIDES en forecast_adjustments.py)
-            # -- no cambia años/growth, solo la predicción mensual mostrada.
-            monthly_predictions = apply_known_month_overrides(monthly_predictions)
+            # El override manual de meses con anomalía documentada (KNOWN_MONTH_OVERRIDES) se aplica más
+            # abajo, después de traer los valores reales, para poder verificar que el mes pertenece a la
+            # misma serie (ver apply_known_month_overrides).
 
             # CAMBIO 3 y 4: Filtrar resultados para el período exacto solicitado y obtener valores reales
             # Crear lista de fechas mensuales solicitadas (calendario del
             # usuario; las predicciones ya llevan etiquetas reales gracias
             # al cutoff / hist truncado -- sin remapeo de años).
-            requested_dates = pd.date_range(
-                start=start_date,
-                end=end_date,
+            # period_range (no date_range de fin de mes): incluye el mes de end_date aunque end_date no sea
+            # fin de mes (p. ej. rango de un solo mes 2026-03-01..2026-03-01).
+            requested_periods = pd.period_range(
+                start=start_date.to_period('M'),
+                end=end_date.to_period('M'),
                 freq='M'
             )
 
@@ -2071,7 +2331,6 @@ class ForecastService:
             
             # Filtrar solo las fechas solicitadas
             monthly_predictions_df['year_month'] = monthly_predictions_df['fecha'].dt.to_period('M')
-            requested_periods = pd.PeriodIndex([d.to_period('M') for d in requested_dates])
             
             filtered_predictions = monthly_predictions_df[
                 monthly_predictions_df['year_month'].isin(requested_periods)
@@ -2079,10 +2338,12 @@ class ForecastService:
             
             # CAMBIO 4: Obtener valores reales para el período de predicción (si existen)
             # Buscar datos reales para el período solicitado
+            # Meses completos: si start/end caen a mitad de mes, la suma del rango exacto sería un mes
+            # parcial comparado contra un pronóstico mensual (error de cientos de %).
             real_data_schema = DemandSearchSchema(
                 tipo=2,
-                fecha_inicio=search.start_date,
-                fecha_fin=search.end_date
+                fecha_inicio=start_date.to_period('M').to_timestamp().strftime('%Y-%m-%d'),
+                fecha_fin=end_date.to_period('M').to_timestamp(how='end').strftime('%Y-%m-%d')
             )
 
             real_data_df = pd.DataFrame()
@@ -2161,115 +2422,145 @@ class ForecastService:
                 print("No hay datos reales disponibles, asignando None")
                 result_df['valor_real'] = None
 
-            # RF (id=1) y XGBoost (id=2): si |error mensual| > 4%,
-            # sustituir por un % estable 1-4% (mismo mes = mismo valor).
+            # ---- Post-proceso: crudo -> override -> tope -> errores (todo en la escala del front) ----
+            # `prediccion` está SIEMPRE en escala de mercado completo (el consumidor multiplica todo el
+            # pronóstico por factor = porcentaje/100, ver predict_excel). Los reales de meses que terminan
+            # después de fecha_limite ("post_division") ya son la porción del nuevo mercado. Por eso el
+            # front compara pred*f contra real*f (pre) o contra real (post); aquí se replica exactamente.
+            result_df['fecha'] = pd.to_datetime(result_df['fecha'])
+            result_df['valor_real'] = pd.to_numeric(result_df['valor_real'], errors='coerce')
+            result_df['prediccion'] = pd.to_numeric(result_df['prediccion'], errors='coerce').astype(float)
+            factor_division = division.factor
+            result_df['post_division'] = division.is_post(result_df['fecha']).astype(bool)
+            result_df['prediccion_cruda'] = result_df['prediccion'].astype(float)
+
+            # Override manual de meses con anomalía puntual documentada (KNOWN_MONTH_OVERRIDES): solo si
+            # el mes tiene real en esta base y coincide con el valor documentado (misma serie/empresa).
+            result_df = apply_known_month_overrides(result_df, require_matching_real=True)
+
+            # RF (id=1) y XGBoost (id=2): tope de |error| mensual. Solo en meses con real donde pronóstico y
+            # real están en la misma escala: los pre-división (ambos en mercado completo) y, si el factor de
+            # división es 1.0, también los post-división (la escala no cambia y el error del front es
+            # (pred - real)/real). Con factor != 1 nunca actúa en post-división (no fabrica error con un
+            # porcentaje configurado que puede no corresponder a los datos).
+            result_df['tope_aplicado'] = False
             if search.id in (1, 2):
-                result_df = cap_xgb_sarimax_error(result_df, model_id=search.id)
+                eligible = ~result_df['post_division'].astype(bool) | (float(factor_division) == 1.0)
+                before_cap = result_df['prediccion'].copy()
+                result_df = cap_xgb_sarimax_error(result_df, model_id=search.id, eligible=eligible)
+                result_df['tope_aplicado'] = (result_df['prediccion'] - before_cap).abs() > 1e-6
 
-            # CAMBIO 5: Calcular métricas de error cuando tengamos ambos valores
-            result_df['error_porcentual'] = None
-            result_df['error_absoluto_mwh'] = None
-            
-            print(f"Columnas en result_df: {result_df.columns.tolist()}")
-            print(f"Shape de result_df: {result_df.shape}")
-            
-            # Calcular errores solo donde tengamos valores reales
-            mask = result_df['valor_real'].notna()
-            print(f"Máscara de valores reales disponibles: {mask.sum()} de {len(mask)}")
-            
-            # Inicializar métricas agregadas
-            mape_total = None
-            error_minimo_mwh = None
-            error_medio_mwh = None
-            error_maximo_mwh = None
-            error_minimo_porcentual = None
-            error_medio_porcentual = None
-            error_maximo_porcentual = None
-            
+            mask = result_df['valor_real'].notna() & (result_df['valor_real'] > 0)
+            post_mask = result_df['post_division'].astype(bool)
+            result_df['error_porcentual'] = np.nan
+            result_df['error_porcentual_crudo'] = np.nan
             if mask.any():
-                print("Calculando errores...")
-                # Calcular errores porcentuales
-                result_df.loc[mask, 'error_porcentual'] = (
-                    (result_df.loc[mask, 'prediccion'] - result_df.loc[mask, 'valor_real']) / 
-                    result_df.loc[mask, 'valor_real'] * 100
-                )
-                
-                # Error absoluto convertido a MWh (dividir por 1,000,000)
-                result_df.loc[mask, 'error_absoluto_mwh'] = abs(
-                    result_df.loc[mask, 'prediccion'] - result_df.loc[mask, 'valor_real']
-                ) / 1_000_000  # Convertir de Wh a MWh
-                
-                # Calcular métricas agregadas para toda la ventana de pronóstico
-                try:
-                    # MAPE total de la ventana de pronóstico
-                    errores_porcentuales_abs = abs(result_df.loc[mask, 'error_porcentual'])
-                    mape_total = float(errores_porcentuales_abs.mean())
-                    print(f"MAPE total calculado: {mape_total}")
-                    
-                    # Errores porcentuales para calcular min, medio, max
-                    errores_porcentuales = abs(result_df.loc[mask, 'error_porcentual'])
-                    error_minimo_porcentual = float(errores_porcentuales.min())
-                    error_medio_porcentual = float(errores_porcentuales.mean())
-                    error_maximo_porcentual = float(errores_porcentuales.max())
-                    print(f"Errores calculados - Min: {error_minimo_mwh}, Medio: {error_medio_mwh}, Max: {error_maximo_mwh}")
-                    
-                except Exception as e:
-                    print(f"Error al calcular métricas agregadas: {str(e)}")
-                    mape_total = None
-                    error_minimo_mwh = None
-                    error_medio_mwh = None
-                    error_maximo_mwh = None
-            else:
-                print("No hay valores reales disponibles para calcular errores")
+                result_df.loc[mask, 'error_porcentual'] = front_scale_pct_error(
+                    result_df.loc[mask, 'prediccion'], result_df.loc[mask, 'valor_real'],
+                    post_mask[mask], factor_division)
+                result_df.loc[mask, 'error_porcentual_crudo'] = front_scale_pct_error(
+                    result_df.loc[mask, 'prediccion_cruda'], result_df.loc[mask, 'valor_real'],
+                    post_mask[mask], factor_division)
+            logger.info("Meses con real: %d de %d; con tope: %d", int(mask.sum()), len(mask),
+                        int(result_df['tope_aplicado'].sum()))
 
-            # Función auxiliar para convertir valores numpy a tipos nativos de Python
+            def _abs_errors(col, m):
+                vals = pd.to_numeric(result_df.loc[m, col], errors='coerce').abs()
+                return vals[np.isfinite(vals)]
+
+            def _error_metrics(col):
+                """(MAPE, mínimo, máximo) del |error| en meses con real; el error medio es el MAPE."""
+                vals = _abs_errors(col, mask)
+                if vals.empty:
+                    return None, None, None
+                return float(vals.mean()), float(vals.min()), float(vals.max())
+
+            mape_total, error_minimo_porcentual, error_maximo_porcentual = _error_metrics('error_porcentual')
+            mape_crudo, err_min_crudo, err_max_crudo = _error_metrics('error_porcentual_crudo')
+            _pre_vals = _abs_errors('error_porcentual_crudo', mask & ~post_mask)
+            mape_crudo_pre = float(_pre_vals.mean()) if not _pre_vals.empty else None
+
+            # Función auxiliar para convertir valores numpy a tipos nativos de Python (JSON válido:
+            # NaN/inf -> None).
             def convert_to_native(value):
-                if pd.isna(value) or value is None:
+                if value is None:
                     return None
-                elif isinstance(value, (np.integer, np.floating)):
-                    return float(value)
-                elif isinstance(value, np.ndarray):
+                if isinstance(value, (bool, np.bool_)):
+                    return bool(value)
+                if isinstance(value, np.ndarray):
                     return value.tolist()
-                else:
+                try:
+                    if pd.isna(value):
+                        return None
+                except (TypeError, ValueError):
                     return value
-            
+                if isinstance(value, (int, float, np.integer, np.floating)):
+                    value = float(value)
+                    return value if np.isfinite(value) else None
+                return value
+
             print("Preparando respuesta final...")
-            
+
             # Reconstruir annual_predictions (lista cruda) a partir de `years`
             # ya ajustado por IPC (Feature 1), en el mismo orden posicional
             # que years_to_predict, para que annual_predictions_full refleje
-            # el ajuste. No hay uso intermedio de la variable cruda entre la
-            # rama de modelo y este punto, así que reconstruirla aquí (justo
-            # antes de su único consumo) es seguro.
+            # el ajuste.
             annual_predictions = [years[y] for y in years_to_predict]
 
             # Preparar respuesta asegurando que todos los valores sean serializables
-            annual_predictions_full = historical_annual_totals + [
-                float(pred) for pred in annual_predictions[:num_years_to_predict]
+            annual_predictions_full = [convert_to_native(v) for v in historical_annual_totals] + [
+                convert_to_native(pred) for pred in annual_predictions[:num_years_to_predict]
             ]
 
+            n_post = int(post_mask.sum())
             response = {
                 "annual_predictions": annual_predictions_full,
                 "monthly_predictions": {
-                    "fechas": result_df['fecha'].dt.strftime('%Y-%m-%d').tolist(),
+                    # Formato de main: fin de mes para ids 1-3, inicio de mes para id 4.
+                    "fechas": contract_month_labels(result_df['fecha'], search.id),
                     "valores_pronostico": [convert_to_native(val) for val in result_df['prediccion'].tolist()],
                     "valores_reales": [convert_to_native(val) for val in result_df['valor_real'].tolist()],
-                    "errores_porcentuales": [convert_to_native(val) for val in result_df['error_porcentual'].tolist()]
+                    "errores_porcentuales": [convert_to_native(val) for val in result_df['error_porcentual'].tolist()],
+                    # --- Campos opcionales (auditoría; no cambian los anteriores) ---
+                    # Pronóstico del modelo (+ escenario IPC) sin override ni tope, escala mercado completo.
+                    "valores_pronostico_crudos": [convert_to_native(val) for val in result_df['prediccion_cruda'].tolist()],
+                    "errores_porcentuales_crudos": [convert_to_native(val) for val in result_df['error_porcentual_crudo'].tolist()],
+                    "tope_aplicado": [bool(v) for v in result_df['tope_aplicado'].tolist()],
+                    "override_aplicado": [bool(v) for v in result_df['override_aplicado'].tolist()],
+                    # True si el real del mes ya está en la escala del nuevo mercado (fin de mes > fecha_limite).
+                    "post_division": [bool(v) for v in post_mask.tolist()],
+                    # Factor que el consumidor aplica UNA sola vez a valores_pronostico (todos los meses).
+                    "factor_division": [factor_division] * len(result_df),
                 },
-                "growth": {str(k): float(v) for k, v in growth.items()},
+                "growth": {str(k): convert_to_native(v) for k, v in growth.items()},
                 "sarimax_macro_fallback": _SARIMAX_MACRO_FALLBACK,
                 "metricas_error": {
                     "mape_total_ventana": mape_total,
                     "error_minimo_%": error_minimo_porcentual,
-                    "error_medio_%": error_medio_porcentual,
+                    "error_medio_%": mape_total,
                     "error_maximo_%": error_maximo_porcentual,
-                    "num_meses_con_datos_reales": int(result_df['valor_real'].notna().sum()),
+                    "num_meses_con_datos_reales": int(mask.sum()),
                     "num_meses_totales": int(len(result_df))
                 },
+                # --- Campos opcionales nuevos ---
+                "metricas_error_crudas": {
+                    "mape_total_ventana": mape_crudo,
+                    "error_minimo_%": err_min_crudo,
+                    "error_medio_%": mape_crudo,
+                    "error_maximo_%": err_max_crudo,
+                    "mape_meses_pre_division": mape_crudo_pre,
+                    "num_meses_con_datos_reales": int(mask.sum()),
+                    "num_meses_post_division_con_real": int((mask & post_mask).sum()),
+                    "num_meses_con_tope": int(result_df['tope_aplicado'].sum()),
+                    "num_meses_con_override": int(result_df['override_aplicado'].sum()),
+                },
+                "escala_pronostico": "mercado_completo",
+                "division_mercado": {**division.as_dict(), "num_meses_post_division": n_post},
+                "modelo": {**model_info, "anios_completados_con_pronostico": v2_estimated_years},
                 "demand_values_for_table": demand_values_for_table,
                 "date_values_for_table": date_values_for_table,
             }
-            
+
             print("Respuesta preparada exitosamente")
             return response
                 
@@ -2762,42 +3053,15 @@ class ForecastService:
         }
 
     def get_number_of_days(self, year, month):
-            """
-            Obtiene el número de días laborales, sábados y domingos/festivos en un mes
-            """
-            import calendar
-            from datetime import datetime, timedelta
-            from holidays_co import get_colombia_holidays_by_year
-            
-            # Obtener días festivos de Colombia usando el módulo del proyecto
-            colombia_holidays = get_colombia_holidays_by_year(year)
-            # Convertir fechas string a objetos date si es necesario
-            holiday_dates = []
-            for holiday in colombia_holidays:
-                if isinstance(holiday, str):
-                    holiday_dates.append(datetime.strptime(holiday, '%Y-%m-%d').date())
-                else:
-                    holiday_dates.append(holiday)
-            
-            # Obtener el primer y último día del mes
-            first_day = datetime(year, month, 1).date()
-            last_day = datetime(year, month, calendar.monthrange(year, month)[1]).date()
-            
-            working_days = 0
-            saturdays = 0
-            sundays_holidays = 0
-            
-            current_date = first_day
-            while current_date <= last_day:
-                if current_date in holiday_dates or current_date.weekday() == 6:  # Domingo o festivo
-                    sundays_holidays += 1
-                elif current_date.weekday() == 5:  # Sábado
-                    saturdays += 1
-                else:  # Día laboral
-                    working_days += 1
-                current_date += timedelta(days=1)
-            
-            return working_days, saturdays, sundays_holidays
+        """Días laborales (lun-vie no festivos), sábados (no festivos) y domingos+festivos de Colombia del mes.
+
+        Usa ``api.services.calendar_co.calendar_counts`` (misma lógica que las features de los modelos v2). La
+        versión anterior comparaba ``date`` contra objetos ``Holiday`` de ``holidays_co`` y nunca contaba festivos.
+        """
+        from api.services.calendar_co import calendar_counts
+
+        _, working_days, saturdays, sundays_holidays = calendar_counts(int(year), int(month))
+        return working_days, saturdays, sundays_holidays
 
 
     def create_type_year_list_service(self, search: CreateTypeYearListSchema, db: Session):
