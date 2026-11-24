@@ -63,3 +63,7 @@ Ver docs/work/06_correcciones/REPORTE.md. Ronda 2 COMPLETA de revision (8 angulo
 - Estado: revisión multi-ángulo + regresión en curso (ronda 1).
 - Ronda 1 clima v3: completados línea-por-línea (sin bugs críticos/altos/medios; bajos: ONI "proyectado" 2026-06..08 tratado como observado, ENSO_PHASE_ONI duplicado) y reuse/efficiency (sin altos; latencia 60 ms; duplicación de helpers en walkforward_clima_v3). Cortados por límite de uso: comportamiento removido, cross-file, altitud/convenciones, regresión -> reanudados con SendMessage.
 - Ronda 1 clima v3 CERRADA (2026-11-24): 5 ángulos + regresión (sonnet), sin críticos/altos => sin ronda 2. Corregido MAPE en rollback v2 y reporte; aceptados bajos listados en docs/work/09_clima_v3/REPORTE.md. Verificación estándar: pytest 281 passed. Commit en rama (sin push).
+
+## Nivel adaptativo (2026-11-24, autorizado por el usuario)
+- Plan: docs/work/11_nivel_adaptativo/PLAN.md; reporte: REPORTE.md. Implementado opt-in `LEVEL_ADAPT=1`, APAGADO por defecto (no gana de forma robusta: VAL mejora, 2026 pooled neutro, peor en orígenes 2026 / start 2026-05). 311 tests pasan. Estado: revisión multi-ángulo + regresión en curso.
+- Nivel adaptativo: ronda 1 CERRADA (4 revisores + regresión, sin críticos/altos). pytest 311 passed. Commit en rama (sin push); flag APAGADO por defecto.

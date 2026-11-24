@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "descripcion": "Correccion adaptativa de nivel (docs/work/11_nivel_adaptativo). Spec elegida SOLO con origenes <= 2023-12 (ver REPORTE.md). Se activa solo con LEVEL_ADAPT=1 (por defecto APAGADA: no gana de forma robusta en 2026).",
+  "spec": {"k": 6, "hl_w": 2.0, "est": "median", "phi": 0.5, "hl_h": 3.0, "cap": 0.06, "min_obs": 3, "tau": 0.0, "agree": 0.0},
+  "models": [1, 2, 4]
+}

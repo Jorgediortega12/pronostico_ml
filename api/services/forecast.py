@@ -40,6 +40,7 @@ import logging
 import os
 from ..other_models.demand import MonthlyDemand, Demand, YearlyDemand, TypeYear
 from api.services import sarimax_macro_constante
+from api.services import forecast_level
 from api.services.demand_config_service import DemandConfigService, adjust_period_value
 from api.services.forecast_adjustments import (
     apply_ipc_adjustment,
@@ -106,6 +107,7 @@ def predict_v2_full_scale(model_id: int, hist_serie: pd.Series, start_m: pd.Time
     fc_start = last + pd.offsets.MonthBegin(1)
     if fc_start > end_m:
         raise ValueError("Rango de pronóstico vacío")
+    ref_fn = None  # pronosticador de referencia para la correccion de nivel (solo con LEVEL_ADAPT=1)
     if model_id in (1, 2):
         art = forecast_rfxgb.load_artifact(model_id)
         refit = _month_ts(art.get("train_last_month")) >= fc_start
@@ -119,15 +121,25 @@ def predict_v2_full_scale(model_id: int, hist_serie: pd.Series, start_m: pd.Time
                        index=pd.DatetimeIndex(df["fecha"]))
         info = {"nombre": df.attrs.get("model_name"), "entrenado_hasta": art.get("train_last_month"),
                 "reestimado": bool(refit)}
+        if forecast_level.applies_to(model_id):
+            ref_fn = forecast_level.ref_fn_rfxgb(model_id, forecast_rfxgb.load_artifact(model_id),
+                                                 forecast_rfxgb.artifact_fingerprint(model_id))
     elif model_id == 3:
         df = forecast_sarimax.predict_monthly(hist, fc_start, end_m, exclude_from=corte)
         fc = pd.Series(df["prediccion"].to_numpy(dtype=float), index=pd.DatetimeIndex(df["fecha"]))
         info = {"nombre": df.attrs.get("modelo"), "reestimado": bool(df.attrs.get("refit"))}
+        if forecast_level.applies_to(model_id):
+            ref_fn = forecast_level.ref_fn_sarimax(corte)
     else:
         raise ValueError(f"Modelo v2 no soportado: id={model_id}")
     expected = _months_between(fc_start, end_m) + 1
     if len(fc) != expected or not np.isfinite(fc.to_numpy()).all() or (fc.to_numpy() <= 0).any():
         raise ValueError("El modelo devolvió un pronóstico incompleto o no finito")
+    if ref_fn is not None:
+        # Correccion adaptativa de nivel (opt-in LEVEL_ADAPT=1): residuos fuera de muestra del propio modelo.
+        fc, ajuste = forecast_level.adjust_forecast(model_id, hist, fc, ref_fn)
+        if ajuste is not None:
+            info["ajuste_nivel"] = ajuste
     info.update({"version": "v2", "ultimo_mes_historia": f"{last:%Y-%m}",
                  "corte_division": f"{corte:%Y-%m}" if corte is not None else None})
     return fc, hist, info
@@ -1300,11 +1312,14 @@ class DemandPredictor:
         if cutoff_year is None:
             ha = self.climate_hist_annual
             cutoff_year = int(ha.loc[ha['n_meses'] >= 12, 'year'].max()) if 'n_meses' in ha.columns else int(ha['year'].max())
+        level_spec = forecast_level.load_config()[0] if forecast_level.applies_to(4) else None
         res = climate_v3.predict_years(
             self.climate_hist_monthly, cutoff_year=int(cutoff_year), forecast_years=int(forecast_years),
-            spec=self.climate_v3_spec, start_month=int(start_month), enso=enso,
+            spec=self.climate_v3_spec, start_month=int(start_month), enso=enso, level_spec=level_spec,
         )
         results = res[['fecha', 'prediccion']].copy()
+        if res.attrs.get("ajuste_nivel") is not None:
+            results.attrs["ajuste_nivel"] = res.attrs["ajuste_nivel"]
         # v3 no usa el corrector de v2 (calibrado con residuos de otro modelo): columnas de trazabilidad idénticas.
         results['prediccion_cruda'] = results['prediccion']
         results['prediccion_ajustada'] = results['prediccion']
@@ -1848,6 +1863,7 @@ class ForecastService:
             # Rama v2: parte de cada total anual pedido que son reales previos a start (no la escala el IPC).
             v2_fixed_by_year = None
             v2_start_m = None
+            ajuste_nivel = None  # correccion adaptativa de nivel (opt-in LEVEL_ADAPT=1); None = no aplicada / flag apagado
 
             print(f"Calculando años de pronóstico. start_date: {start_date}, end_date: {end_date}")
             forecast_years = end_date.year - start_date.year + 1
@@ -2076,7 +2092,9 @@ class ForecastService:
                 hist = load_clean_history_session(db, division)
                 v2_start_m = start_date.to_period('M').to_timestamp()
                 v2 = run_v2_forecast(search.id, hist.serie, hist.corte, v2_start_m, years_to_predict, years)
-                model_info.update(v2["info"])
+                v2_info = dict(v2["info"])
+                ajuste_nivel = v2_info.pop("ajuste_nivel", None)
+                model_info.update(v2_info)
                 years = v2["years"]
                 v2_fixed_by_year = v2["fixed_by_year"]
                 v2_estimated_years.extend(v2["estimated_years"])
@@ -2239,6 +2257,8 @@ class ForecastService:
                         start_month=int(start_date.month),
                         model_version=climate_version,
                     )
+
+                    ajuste_nivel = monthly_predictions.attrs.get("ajuste_nivel")
 
                     # VALIDACIÓN: Verificar que tengamos el número correcto de predicciones
                     if len(annual_predictions) != num_years_to_predict:
@@ -2625,6 +2645,7 @@ class ForecastService:
                 "escala_pronostico": "mercado_completo",
                 "division_mercado": {**division.as_dict(), "num_meses_post_division": n_post},
                 "modelo": {**model_info, "anios_completados_con_pronostico": v2_estimated_years},
+                **({"ajuste_nivel": ajuste_nivel} if ajuste_nivel is not None else {}),
                 "demand_values_for_table": demand_values_for_table,
                 "date_values_for_table": date_values_for_table,
             }

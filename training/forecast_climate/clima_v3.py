@@ -188,6 +188,7 @@ def predict_years(
     spec: V3Spec,
     start_month: int = 1,
     enso: Optional[dict] = None,
+    level_spec=None,
 ) -> pd.DataFrame:
     """Pronostico mensual de los anios ``cutoff_year+1 .. cutoff_year+forecast_years`` (12 meses cada uno).
 
@@ -197,6 +198,11 @@ def predict_years(
     modelos 1-3: solo lo conocido antes de ``start_date``). Si el historico termina antes del origen pedido (p. ej.
     ``cutoff_year`` = ultimo anio parcial), el origen es el ultimo mes disponible y los meses faltantes se
     pronostican. Los meses ``<= origen`` que caen en el primer anio devuelto son los valores observados.
+
+    ``level_spec`` (``training.common.level_adapt.LevelSpec``, opcional; por defecto ``None`` = sin cambio): aplica la
+    correccion adaptativa de nivel a los meses pronosticados con residuos fuera de muestra de este mismo modelo
+    (pronostico de referencia desde ``origen - k`` meses con ``predict_v3`` y SIN escenario ENSO); el resumen queda en
+    ``df.attrs["ajuste_nivel"]``.
 
     Devuelve ``fecha, prediccion, observado`` (``observado`` = True si el mes es dato real, no pronostico).
     """
@@ -218,6 +224,18 @@ def predict_years(
     fc = predict_v3(h, horizon, spec, enso=enso)
     obs = pd.Series(h["demand_value"].to_numpy(float),
                     index=pd.DatetimeIndex(pd.to_datetime(dict(year=h["year"], month=h["month"], day=1))))
+    ajuste = None
+    if level_spec is not None:
+        from training.common import level_adapt
+
+        def ref_fn(hist_ref: pd.Series, k: int) -> pd.Series:
+            key = hist_ref.index.year * 12 + hist_ref.index.month
+            hr = h[(h["year"] * 12 + h["month"]) <= int(key.max())]
+            return predict_v3(hr, k, spec)  # sin escenario ENSO: solo importa el ONI observado/proyectado hasta ``last``
+
+        res = level_adapt.adjust(obs, fc, ref_fn, level_spec, level_adapt.covid_exclusions())
+        fc = level_adapt.apply_level(fc, res)
+        ajuste = res.to_dict()
     rows = []
     for yr in range(cutoff_year + 1, last_target_year + 1):
         for m in range(1, 13):
@@ -228,4 +246,7 @@ def predict_years(
                 rows.append((ts, float(obs.loc[ts]), True))
             else:  # hueco previo al historico disponible: no deberia ocurrir (historico contiguo)
                 raise ValueError(f"mes {ts:%Y-%m} fuera del historico y del horizonte")
-    return pd.DataFrame(rows, columns=["fecha", "prediccion", "observado"])
+    out = pd.DataFrame(rows, columns=["fecha", "prediccion", "observado"])
+    if ajuste is not None:
+        out.attrs["ajuste_nivel"] = ajuste
+    return out
