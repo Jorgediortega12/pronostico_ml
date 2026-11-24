@@ -56,3 +56,10 @@ Ver docs/work/06_correcciones/REPORTE.md. Ronda 2 COMPLETA de revision (8 angulo
 - Commits en rama mejora/modelos-forecast-noche (sin push): 0f30736 (datos/harness/diagnostico), ab27f6c (modelos v2 + integracion), c114560 (docs y log). `git status` limpio salvo este cierre.
 - Para revertir modelos: `git checkout main -- api/models api/services/forecast.py api/services/forecast_adjustments.py`.
 - Pendiente humano: (1) confirmar configuracion demand_split_config de la BD real (70% hasta 2026-08-31 en las capturas; la copia local trae 2026-09-01/100%); (2) revisar con el front el cambio de campos opcionales y metricas_error_crudas; (3) push/merge y despliegue; (4) opcional: clima id4 aun lee CSV propio (no la BD de la peticion).
+
+## Clima v3 (2026-11-24, sesión diurna, autorizado por el usuario)
+- Motivo: id 4 quedó último en precisión (5.07 ene-ago 2026) y sin memoria del nivel reciente. Plan: docs/work/09_clima_v3/PLAN.md; reporte: docs/work/09_clima_v3/REPORTE.md.
+- Implementado v3 mensual (clima_v3.py), activo por defecto; rollback `CLIMATE_MODEL_VERSION=v2`. 281 tests pasan. Ene-ago 2026: 3.98 (v2 5.07, naive+drift 3.96). Pool objetivos ≥2026: 4.15 vs v2 4.09 (sin mejora).
+- Estado: revisión multi-ángulo + regresión en curso (ronda 1).
+- Ronda 1 clima v3: completados línea-por-línea (sin bugs críticos/altos/medios; bajos: ONI "proyectado" 2026-06..08 tratado como observado, ENSO_PHASE_ONI duplicado) y reuse/efficiency (sin altos; latencia 60 ms; duplicación de helpers en walkforward_clima_v3). Cortados por límite de uso: comportamiento removido, cross-file, altitud/convenciones, regresión -> reanudados con SendMessage.
+- Ronda 1 clima v3 CERRADA (2026-11-24): 5 ángulos + regresión (sonnet), sin críticos/altos => sin ronda 2. Corregido MAPE en rollback v2 y reporte; aceptados bajos listados en docs/work/09_clima_v3/REPORTE.md. Verificación estándar: pytest 281 passed. Commit en rama (sin push).

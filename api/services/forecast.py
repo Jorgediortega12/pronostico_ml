@@ -213,12 +213,14 @@ try:
     if str(_BACKEND_ROOT) not in _sys.path:
         _sys.path.insert(0, str(_BACKEND_ROOT))
     from training.forecast_climate import features as climate_features
+    from training.forecast_climate import clima_v3 as climate_v3
     from training.forecast_climate.postprocess_calibration import (
         apply_correctors as climate_apply_correctors,
         load_corrector_artifact as climate_load_corrector_artifact,
     )
 except Exception as _climate_import_error:
     climate_features = None
+    climate_v3 = None
     climate_apply_correctors = None
     climate_load_corrector_artifact = None
     print(f"[climate_model] No se pudo importar el soporte del modelo climático: {_climate_import_error}")
@@ -451,6 +453,9 @@ class DemandPredictor:
                 self.climate_monthly_model = joblib.load(f'{model_path}monthly_model.pkl')
                 self.climate_model_info = joblib.load(f'{model_path}model_info.pkl')
                 climate_metrics = joblib.load(f'{model_path}metrics.pkl')
+                # Con CLIMATE_MODEL_VERSION=v2 (rollback) el MAPE mostrado debe ser el de v2 (guardado en metrics['v2']).
+                if os.getenv("CLIMATE_MODEL_VERSION", "").strip().lower() == "v2" and isinstance(climate_metrics.get('v2'), dict):
+                    climate_metrics = climate_metrics['v2']
                 self.climate_annual_mape = climate_metrics['annual']['mape']
                 self.climate_monthly_mape = climate_metrics['monthly']['mape']
 
@@ -475,6 +480,20 @@ class DemandPredictor:
                 _climate_artifacts_dir = _BACKEND_ROOT / 'training' / 'forecast_climate' / 'artifacts'
                 self.climate_hist_monthly = pd.read_csv(_climate_artifacts_dir / 'dataset_mensual.csv')
                 self.climate_hist_annual = pd.read_csv(_climate_artifacts_dir / 'dataset_anual.csv')
+
+                # v3 (nivel reciente + deriva + beta ENSO, base mensual): hiperparametros en climate_v3.json
+                # (no hay pesos: nivel/estacionalidad/beta se re-estiman en cada llamada con el historico
+                # anterior al inicio pedido, igual que en el walk-forward). Sin el archivo -> solo v2.
+                self.climate_v3_spec = None
+                try:
+                    _v3_path = os.path.join(model_path, 'climate_v3.json')
+                    if climate_v3 is not None and os.path.exists(_v3_path):
+                        with open(_v3_path, encoding='utf-8') as _fh:
+                            self.climate_v3_info = json.load(_fh)
+                        self.climate_v3_spec = climate_v3.spec_from_dict(self.climate_v3_info['spec'])
+                except Exception as v3_error:
+                    print(f"[climate_model] No se pudo cargar climate_v3.json (se usa v2): {v3_error}")
+                    self.climate_v3_spec = None
         except Exception as e:
             print(f"Error al cargar el modelo: {str(e)}")
 
@@ -1271,6 +1290,28 @@ class DemandPredictor:
             raise ValueError("No hay histórico climático real disponible (tras filtrar atypical_years).")
         return int(df['year'].max())
 
+    def _predict_future_climate_v3(self, forecast_years, atypical_years, cutoff_year, enso_phase_by_month, start_month):
+        """Rama v3 de `predict_future_climate` (misma forma de salida: `(annual_pred (n,1), results)`)."""
+        if climate_v3 is None or getattr(self, 'climate_v3_spec', None) is None:
+            raise ValueError("El modelo climático v3 no está disponible (falta climate_v3.json o training.forecast_climate).")
+        if atypical_years:
+            raise ValueError("atypical_years no está soportado por el modelo climático v3.")
+        enso = {k: v for k, v in (enso_phase_by_month or {}).items() if v in ENSO_PHASE_ONI}
+        if cutoff_year is None:
+            ha = self.climate_hist_annual
+            cutoff_year = int(ha.loc[ha['n_meses'] >= 12, 'year'].max()) if 'n_meses' in ha.columns else int(ha['year'].max())
+        res = climate_v3.predict_years(
+            self.climate_hist_monthly, cutoff_year=int(cutoff_year), forecast_years=int(forecast_years),
+            spec=self.climate_v3_spec, start_month=int(start_month), enso=enso,
+        )
+        results = res[['fecha', 'prediccion']].copy()
+        # v3 no usa el corrector de v2 (calibrado con residuos de otro modelo): columnas de trazabilidad idénticas.
+        results['prediccion_cruda'] = results['prediccion']
+        results['prediccion_ajustada'] = results['prediccion']
+        annual = [float(results.loc[results['fecha'].dt.year == cutoff_year + 1 + i, 'prediccion'].sum())
+                  for i in range(int(forecast_years))]
+        return np.array(annual).reshape(-1, 1), results
+
     def predict_future_climate(
         self,
         forecast_years=1,
@@ -1280,9 +1321,18 @@ class DemandPredictor:
         apply_corrector=False,
         cutoff_year: int | None = None,
         enso_phase_by_month: dict[str, str] | None = None,
+        start_month: int = 1,
+        model_version: str | None = None,
     ):
         """
         Predicción futura del modelo id=4 (clima + ONI).
+
+        `model_version="v3"` (lo usa `ForecastService` cuando existe `climate_v3.json`): modelo mensual con nivel
+        reciente (ver `training/forecast_climate/clima_v3.py` y `docs/work/09_clima_v3/REPORTE.md`); ignora
+        `n_years_clim`, `n_years_shape`, `apply_corrector` y no admite `atypical_years`. `start_month` es el mes
+        (1-12) de `cutoff_year+1` desde el cual se pronostica: los meses anteriores de ese año se toman como
+        observados (misma semántica que ids 1-3: solo se usa lo conocido antes de `start_date`).
+        Con `model_version=None`/"v2" el comportamiento es el v2 documentado abajo (anual + reparto mensual).
 
         Replica la estructura secuencial anual + mensual de
         `predict_future_xgrf`, pero SIN requerir variables macro futuras
@@ -1354,6 +1404,12 @@ class DemandPredictor:
         if climate_features is None or climate_apply_correctors is None:
             raise ValueError(
                 "El soporte del modelo climático (training.forecast_climate) no está disponible en este entorno."
+            )
+
+        if model_version == "v3":
+            return self._predict_future_climate_v3(
+                forecast_years=forecast_years, atypical_years=atypical_years, cutoff_year=cutoff_year,
+                enso_phase_by_month=enso_phase_by_month, start_month=start_month,
             )
 
         try:
@@ -2143,7 +2199,15 @@ class ForecastService:
                     # peor en los orígenes posteriores a la selección (ver docs/work/04_clima/REPORTE.md y
                     # docs/work/04_clima/forecast_clima_patch.md).
                     climate_n_years_shape = 2
-                    model_info.update({"nombre": "clima_oni_v2", "n_years_shape": climate_n_years_shape})
+                    # v3 (nivel reciente + deriva + beta ENSO, base mensual; docs/work/09_clima_v3/REPORTE.md) si
+                    # existe climate_v3.json. CLIMATE_MODEL_VERSION=v2 fuerza el modelo anterior (rollback).
+                    climate_version = "v3" if getattr(predictor, "climate_v3_spec", None) is not None else "v2"
+                    if os.getenv("CLIMATE_MODEL_VERSION", "").strip().lower() == "v2":
+                        climate_version = "v2"
+                    if climate_version == "v3":
+                        model_info.update({"nombre": "clima_oni_v3", "version": "v3"})
+                    else:
+                        model_info.update({"nombre": "clima_oni_v2", "n_years_shape": climate_n_years_shape})
 
                     # El histórico climático (CSV) llega hasta last_real_year; el modelo emite los años
                     # cutoff_year+1.. con cutoff_year <= last_real_year. Si el primer año pedido está más allá
@@ -2172,6 +2236,8 @@ class ForecastService:
                         cutoff_year=cutoff_year,
                         enso_phase_by_month=getattr(search, 'enso_phase_by_month', None),
                         n_years_shape=climate_n_years_shape,
+                        start_month=int(start_date.month),
+                        model_version=climate_version,
                     )
 
                     # VALIDACIÓN: Verificar que tengamos el número correcto de predicciones
@@ -2201,6 +2267,7 @@ class ForecastService:
                             cutoff_year=last_real_year,
                             enso_phase_by_month=getattr(search, 'enso_phase_by_month', None),
                             n_years_shape=climate_n_years_shape,
+                            model_version=climate_version,
                         )
 
                     # Calcular crecimiento usando los años correctos (annual_pred es (n, 1): se aplana para
@@ -2243,6 +2310,7 @@ class ForecastService:
                                     atypical_years=atypical_years,
                                     cutoff_year=prev_year - 1,
                                     n_years_shape=climate_n_years_shape,
+                                    model_version=climate_version,
                                 )
                                 years[prev_year] = int(np.asarray(prev_annual, dtype=float).ravel()[0])
                                 v2_estimated_years.append(int(prev_year))

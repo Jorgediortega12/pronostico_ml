@@ -1,0 +1,14 @@
+{
+  "version": "v1",
+  "fecha_calibracion": "2026-08-04T00:22:24.315288+00:00",
+  "decay_rate": 0.182,
+  "calibrated_on": "1950-2026",
+  "mse_calibracion": 0.6708335920115458,
+  "fallback_decay_rate": 0.15,
+  "metodo": "walk_forward_grid_search_mse",
+  "train_meta": {
+    "n_pares_walkforward": 21708,
+    "max_horizon_meses": 24,
+    "n_years_clim": 10
+  }
+}

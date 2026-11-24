@@ -1,0 +1,37 @@
+{
+  "version": "v3",
+  "spec": {
+    "family": "B",
+    "k_recent": 72,
+    "w_recent": 0.5,
+    "beta_mode": "ols",
+    "beta_shrink": 1.0,
+    "beta_fixed": 0.0,
+    "beta_window": null,
+    "oni_lag": 0,
+    "window": 60,
+    "slope": "fixed",
+    "drift_cap": null
+  },
+  "fecha_entrenamiento": "2026-11-24T13:13:15.043639+00:00",
+  "ultimo_mes_historico": "2026-08",
+  "beta_oni_por_unidad_estimado_al_ultimo_mes": 0.02258733902228202,
+  "deriva_anual_log_estimada_al_ultimo_mes": 0.0492116014206459,
+  "formula": "log D_t = a + g*tau + estacionalidad_mes + beta*ONI_t (ventana 'window' meses; a, estacionalidad por MCO; beta por MCO expansivo sobre Delta12; g = mezcla deriva reciente/larga)",
+  "metricas_walkforward": {
+    "annual": {
+      "mape": 2.0266166579240825,
+      "model": "v3 (suma de 12 meses, origen dic previo)",
+      "protocolo": "walk-forward or\u00edgenes dic 2017-12..2025-12, total anual h1-12 con 12 meses reales, sin COVID"
+    },
+    "monthly": {
+      "mape": 3.7156822852975506,
+      "sesgo": 0.433669134981719,
+      "mape_h1_12": 3.4861982926011503,
+      "mape_h13_24": 3.9800246059984663,
+      "model": "clima_oni_v3 (regresi\u00f3n de nivel por ventana + deriva + beta ONI)",
+      "protocolo": "walk-forward or\u00edgenes dic 2017-12..2025-12, h=1..24, crudo, sin COVID ni post-quiebre"
+    }
+  },
+  "fuente": "docs/work/09_clima_v3/REPORTE.md; training/forecast_climate/walkforward_clima_v3.py (CHOSEN)"
+}

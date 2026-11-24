@@ -1,0 +1,52 @@
+{
+  "version": "v1",
+  "fecha_calibracion": "2026-11-24T04:45:31.695596+00:00",
+  "bias_corrector": {
+    "correccion_pct": -0.014650099619378841,
+    "n_observaciones": 6,
+    "metodo": "promedio_error_reciente_prior_blend",
+    "peso_prior_usado": 0.7
+  },
+  "seasonal_corrector": {
+    "correcciones": {
+      "1": 0.01267664768174293,
+      "2": 0.0047862439992788115,
+      "3": 0.014929375657633588,
+      "4": 0.00012558260704322727,
+      "5": -0.002873840795876003,
+      "6": -0.008522581561947844,
+      "7": -0.002868446649266221,
+      "8": -0.00854322439239627,
+      "9": -0.02264428026242815,
+      "10": -0.012063308951373697,
+      "11": -0.007413827007700085,
+      "12": -0.012849369660556205
+    },
+    "n_observaciones_por_mes": {
+      "1": 8,
+      "2": 8,
+      "3": 8,
+      "4": 8,
+      "5": 8,
+      "6": 8,
+      "7": 8,
+      "8": 8,
+      "9": 7,
+      "10": 8,
+      "11": 8,
+      "12": 8
+    },
+    "metodo": "residual_promedio_por_mes_calendario",
+    "min_obs_por_mes": 3
+  },
+  "metodo": "bias_reciente + estacional_residual",
+  "train_meta": {
+    "n_meses_total": 95,
+    "n_observaciones_bias": 6,
+    "fuente_datos": "residuos walk-forward (pronóstico más reciente por mes, objetivos <= 2025-12) del modelo v2",
+    "sin_fuga": true,
+    "aplicado_por_defecto": false,
+    "nota": "forecast.py lo calcula como prediccion_ajustada pero sirve la cruda (apply_corrector=False); ver docs/work/04_clima/REPORTE.md",
+    "n_pares": 95
+  }
+}
