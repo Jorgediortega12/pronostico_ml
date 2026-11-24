@@ -50,3 +50,9 @@ Ver docs/work/06_correcciones/REPORTE.md. Ronda 2 COMPLETA de revision (8 angulo
 - Medios: fechas ids 1-3 pasaron de fin a inicio de mes (2 revisores) -> volver al formato de main; cache refit RF/XGB 8 entradas insuficiente -> 32; historia minima RF/XGB inconsistente con filas requeridas; honestidad (solo objetivos >=2026 n=164 son OOS puro: RF 5.92, XGB 5.79, naive+drift 5.40, Clima 3.83; id4 no reentrena en hindcast; nota_metricas en artefactos); calendario duplicado rfxgb/sarimax; CSV e2e obsoletos de Clima.
 - Aceptados (baja): carrera menor de single-flight en camino de error, ramas de comportamiento anterior en forecast_adjustments, growth id4 cruzando 2026 (+8.3% vs ~5.8%) solo documentado, analysis.get_number_of_days preexistente.
 - agente-correcciones-2 lanzado (docs/work/07_correcciones_r2/REPORTE.md). Siguiente: verificacion estandar -> commits.
+
+## CIERRE (2026-11-24)
+- Correcciones ronda 2 aplicadas (docs/work/07_correcciones_r2/REPORTE.md). Verificacion estandar: pytest 266 passed. Sin ronda 3 (ronda 2 sin criticos/altos).
+- Commits en rama mejora/modelos-forecast-noche (sin push): 0f30736 (datos/harness/diagnostico), ab27f6c (modelos v2 + integracion), c114560 (docs y log). `git status` limpio salvo este cierre.
+- Para revertir modelos: `git checkout main -- api/models api/services/forecast.py api/services/forecast_adjustments.py`.
+- Pendiente humano: (1) confirmar configuracion demand_split_config de la BD real (70% hasta 2026-08-31 en las capturas; la copia local trae 2026-09-01/100%); (2) revisar con el front el cambio de campos opcionales y metricas_error_crudas; (3) push/merge y despliegue; (4) opcional: clima id4 aun lee CSV propio (no la BD de la peticion).
