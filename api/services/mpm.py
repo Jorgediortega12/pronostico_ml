@@ -195,27 +195,50 @@ class MPMService:
 
     def get_latest_files_by_type(self, db: Session):
         """
-        Obtiene los registros más recientes de cada tipo de archivo desde LastDemandDocument
+        Última fecha con datos de cada tipo de archivo (txf, txr, tx2).
+
+        La fecha sale de lo que realmente está cargado en la tabla de demandas, así que incluye lo que se sube
+        desde Análisis de datos. La tabla GMR_last_demand_document (la llenaba la sincronización por FTP del GMR
+        original) ya no se actualiza con esas cargas: solo se usa para la ruta del archivo y como respaldo cuando
+        no hay demandas de ese tipo, o cuando la tabla ni siquiera existe en la base.
         """
         try:
             latest_files = {}
 
             for file_type in ['txf', 'txr', 'tx2']:
-                last_doc = db.query(LastDemandDocument).filter_by(
-                    document_type=file_type.lower()
-                ).first()
-                if last_doc and last_doc.document_date:
+                last_date = (
+                    db.query(func.max(Demand.fecha))
+                    .filter(func.lower(func.coalesce(Demand.file_type, 'txf')) == file_type)
+                    .scalar()
+                )
+
+                last_doc = None
+                try:
+                    last_doc = db.query(LastDemandDocument).filter_by(document_type=file_type).first()
+                except SQLAlchemyError as e:
+                    # Base sin la tabla heredada: se sigue solo con las demandas.
+                    db.rollback()
+                    print(f"GMR_last_demand_document no disponible ({file_type}): {str(e).splitlines()[0]}")
+
+                if last_date is not None:
+                    latest_files[file_type] = {
+                        'file_path': last_doc.document_route if last_doc else None,
+                        'date': last_date,
+                        'date_str': last_date.strftime('%Y-%m-%d')
+                    }
+                    print(f"Última demanda {file_type.upper()}: {last_date.strftime('%Y-%m-%d')}")
+                elif last_doc and last_doc.document_date:
                     latest_files[file_type] = {
                         'file_path': last_doc.document_route,
                         'date': last_doc.document_date,
                         'date_str': last_doc.document_date.strftime('%Y-%m-%d')
                     }
-                    print(f"Último archivo {file_type.upper()}: {last_doc.document_route} (fecha: {last_doc.document_date.strftime('%Y-%m-%d')})")
+                    print(f"Último archivo {file_type.upper()} (tabla heredada): {last_doc.document_route} (fecha: {last_doc.document_date.strftime('%Y-%m-%d')})")
                 else:
                     print(f"No se encontraron registros de tipo {file_type.upper()}")
-            
+
             return latest_files
-            
+
         except Exception as e:
             print(f"Error getting latest files by type: {str(e)}")
             return {}
